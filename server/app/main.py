@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .api.routes import router as api_router
+
 app = FastAPI(
     title="ScrapeCrawlAI",
     description="BFS-based web crawler and scraper with multi-worker architecture",
@@ -15,6 +17,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include API router
+app.include_router(api_router)
 
 
 @app.get("/health")
