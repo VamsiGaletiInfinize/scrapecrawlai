@@ -29,6 +29,8 @@ export function CrawlForm({ onSubmit, isLoading }: CrawlFormProps) {
   const [mode, setMode] = useState<CrawlMode>('crawl_scrape');
   const [maxDepth, setMaxDepth] = useState(3);
   const [workerCount, setWorkerCount] = useState(4);
+  const [allowSubdomains, setAllowSubdomains] = useState(false);
+  const [allowedDomainsInput, setAllowedDomainsInput] = useState('');
   const [error, setError] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -43,11 +45,19 @@ export function CrawlForm({ onSubmit, isLoading }: CrawlFormProps) {
       return;
     }
 
+    // Parse allowed domains from comma-separated input
+    const allowedDomains = allowedDomainsInput
+      .split(',')
+      .map(d => d.trim())
+      .filter(d => d.length > 0);
+
     onSubmit({
       seed_url: seedUrl,
       mode,
       max_depth: maxDepth,
       worker_count: workerCount,
+      allow_subdomains: allowSubdomains,
+      allowed_domains: allowedDomains,
     });
   };
 
@@ -126,6 +136,34 @@ export function CrawlForm({ onSubmit, isLoading }: CrawlFormProps) {
             <span>10</span>
           </div>
         </div>
+      </div>
+
+      <div className="form-group">
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={allowSubdomains}
+            onChange={(e) => setAllowSubdomains(e.target.checked)}
+            disabled={isLoading}
+          />
+          <span>Allow Subdomains</span>
+        </label>
+        <span className="checkbox-description">
+          Crawl all subdomains of the seed URL's domain (e.g., blog.example.com, docs.example.com)
+        </span>
+      </div>
+
+      <div className="form-group">
+        <label htmlFor="allowedDomains">Additional Allowed Domains</label>
+        <input
+          id="allowedDomains"
+          type="text"
+          value={allowedDomainsInput}
+          onChange={(e) => setAllowedDomainsInput(e.target.value)}
+          placeholder="cdn.example.com, api.example.com"
+          disabled={isLoading}
+        />
+        <span className="input-hint">Comma-separated list of additional domains to crawl</span>
       </div>
 
       {error && <div className="form-error">{error}</div>}

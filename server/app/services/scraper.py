@@ -1,6 +1,12 @@
-import time
+"""
+Enhanced content extraction service with connection pooling,
+retry logic, and rate limiting integration.
+"""
+
 import asyncio
+import random
 import re
+import time
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
@@ -9,49 +15,108 @@ from bs4 import BeautifulSoup
 
 from ..models.crawl import URLTask, PageResult, CrawlMode
 from .timer import PageTimer
+from .rate_limiter import rate_limiter
+from .robots import robots_checker
+
+
+# User agent pool for rotation
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+]
+
+
+def get_random_user_agent() -> str:
+    """Get a random user agent from the pool."""
+    return random.choice(USER_AGENTS)
 
 
 class ScraperService:
     """
-    Content extraction service using aiohttp and BeautifulSoup.
-
-    Handles fetching pages, extracting links, and scraping content.
+    Enhanced content extraction service with:
+    - Connection pooling for better performance
+    - DNS caching
+    - Retry logic with exponential backoff
+    - User-agent rotation
+    - Rate limiting integration
+    - Robots.txt compliance
     """
 
-    def __init__(self, mode: CrawlMode, timeout: int = 30):
+    def __init__(
+        self,
+        mode: CrawlMode,
+        timeout: int = 30,
+        max_retries: int = 3,
+        respect_robots: bool = True,
+        use_rate_limiting: bool = True,
+    ):
         """
         Initialize the scraper service.
 
         Args:
             mode: Crawl execution mode
             timeout: Request timeout in seconds
+            max_retries: Maximum retry attempts for failed requests
+            respect_robots: Whether to check robots.txt
+            use_rate_limiting: Whether to use rate limiting
         """
         self.mode = mode
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.timeout = aiohttp.ClientTimeout(total=timeout, connect=10)
+        self.max_retries = max_retries
+        self.respect_robots = respect_robots
+        self.use_rate_limiting = use_rate_limiting
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the aiohttp session."""
+        """
+        Get or create the aiohttp session with connection pooling.
+
+        Connection pooling benefits:
+        - Reuses TCP connections (avoids handshake overhead)
+        - DNS caching (avoids repeated lookups)
+        - Keep-alive connections
+        """
         if self._session is None or self._session.closed:
+            # Create connector with connection pooling
+            self._connector = aiohttp.TCPConnector(
+                limit=100,              # Total connection pool size
+                limit_per_host=10,      # Connections per domain
+                ttl_dns_cache=300,      # DNS cache TTL (5 minutes)
+                keepalive_timeout=30,   # Keep connections alive
+                enable_cleanup_closed=True,
+            )
+
             headers = {
-                "User-Agent": "ScrapeCrawlAI/1.0 (Web Crawler)",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
             }
+
             self._session = aiohttp.ClientSession(
+                connector=self._connector,
                 timeout=self.timeout,
                 headers=headers,
             )
         return self._session
 
     async def close(self):
-        """Close the aiohttp session."""
+        """Close the aiohttp session and connector."""
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
+        await robots_checker.close()
 
     async def fetch_page(self, task: URLTask) -> tuple[PageResult, list[str]]:
         """
-        Fetch and process a single page.
+        Fetch and process a single page with retries.
 
         Args:
             task: URL task to process
@@ -69,55 +134,119 @@ class ScraperService:
             depth=task.depth,
         )
 
-        try:
-            session = await self._get_session()
-            async with session.get(task.url) as response:
-                if response.status != 200:
-                    result.error = f"HTTP {response.status}"
+        # Check robots.txt
+        if self.respect_robots:
+            try:
+                can_fetch = await robots_checker.can_fetch(task.url)
+                if not can_fetch:
+                    result.error = "Blocked by robots.txt"
                     result.timing_ms = timer.stop()
                     return result, discovered_urls
 
-                html = await response.text()
+                # Set crawl delay from robots.txt
+                crawl_delay = robots_checker.get_crawl_delay(task.url)
+                if crawl_delay > 0:
+                    domain = urlparse(task.url).netloc
+                    rate_limiter.set_delay(domain, crawl_delay)
+            except Exception:
+                pass  # Continue if robots check fails
 
-                # Parse with BeautifulSoup
-                soup = BeautifulSoup(html, 'lxml')
+        # Apply rate limiting
+        if self.use_rate_limiting:
+            await rate_limiter.acquire(task.url)
 
-                # Extract links for crawling
-                discovered_urls = self._extract_links(soup, task.url)
-                result.links_found = len(discovered_urls)
-
-                # Extract content if scraping is enabled
-                if self.mode in (CrawlMode.ONLY_SCRAPE, CrawlMode.CRAWL_SCRAPE):
-                    result.title = self._extract_title(soup)
-                    result.headings = self._extract_headings(soup)
-                    result.content = self._extract_content(soup)
-
-        except asyncio.TimeoutError:
-            result.error = "Request timeout"
-        except aiohttp.ClientError as e:
-            result.error = f"Client error: {str(e)}"
-        except Exception as e:
-            result.error = f"Unexpected error: {str(e)}"
-
+        # Fetch with retries
+        result, discovered_urls = await self._fetch_with_retry(task, result)
         result.timing_ms = timer.stop()
+
+        return result, discovered_urls
+
+    async def _fetch_with_retry(
+        self,
+        task: URLTask,
+        result: PageResult,
+    ) -> tuple[PageResult, list[str]]:
+        """
+        Fetch page with exponential backoff retry.
+
+        Args:
+            task: URL task to process
+            result: PageResult to populate
+
+        Returns:
+            Tuple of (PageResult, discovered_urls)
+        """
+        discovered_urls: list[str] = []
+        delays = [1, 2, 4]  # Exponential backoff delays
+        last_error = None
+
+        for attempt in range(self.max_retries):
+            try:
+                session = await self._get_session()
+
+                # Rotate user agent per request
+                headers = {"User-Agent": get_random_user_agent()}
+
+                async with session.get(task.url, headers=headers) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, 'lxml')
+
+                        # Extract links
+                        discovered_urls = self._extract_links(soup, task.url)
+                        result.links_found = len(discovered_urls)
+
+                        # Extract content if scraping enabled
+                        if self.mode in (CrawlMode.ONLY_SCRAPE, CrawlMode.CRAWL_SCRAPE):
+                            result.title = self._extract_title(soup)
+                            result.headings = self._extract_headings(soup)
+                            result.content = self._extract_content(soup)
+
+                        return result, discovered_urls
+
+                    elif response.status == 429:
+                        # Rate limited - wait longer
+                        result.error = f"Rate limited (429)"
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(delays[attempt] * 2)
+                            continue
+
+                    elif response.status >= 500:
+                        # Server error - retry
+                        last_error = f"HTTP {response.status}"
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(delays[attempt])
+                            continue
+
+                    else:
+                        # Client error - don't retry
+                        result.error = f"HTTP {response.status}"
+                        return result, discovered_urls
+
+            except asyncio.TimeoutError:
+                last_error = "Request timeout"
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(delays[attempt])
+
+            except aiohttp.ClientError as e:
+                last_error = f"Client error: {str(e)}"
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(delays[attempt])
+
+            except Exception as e:
+                last_error = f"Unexpected error: {str(e)}"
+                break  # Don't retry on unexpected errors
+
+        result.error = last_error
         return result, discovered_urls
 
     def _extract_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
-        """
-        Extract all links from the page.
-
-        Args:
-            soup: BeautifulSoup parsed HTML
-            base_url: Base URL for resolving relative links
-
-        Returns:
-            List of absolute URLs
-        """
+        """Extract all links from the page."""
         links = []
         for anchor in soup.find_all('a', href=True):
             href = anchor['href'].strip()
 
-            # Skip empty, javascript, mailto, tel links
+            # Skip invalid links
             if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#', 'data:')):
                 continue
 
@@ -127,9 +256,13 @@ class ScraperService:
             # Validate URL
             parsed = urlparse(absolute_url)
             if parsed.scheme in ('http', 'https'):
-                links.append(absolute_url)
+                # Clean URL (remove fragment)
+                clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                if parsed.query:
+                    clean_url += f"?{parsed.query}"
+                links.append(clean_url)
 
-        return links
+        return list(set(links))  # Remove duplicates
 
     def _extract_title(self, soup: BeautifulSoup) -> Optional[str]:
         """Extract page title."""
@@ -137,7 +270,6 @@ class ScraperService:
         if title_tag:
             return title_tag.get_text(strip=True)
 
-        # Fallback to h1
         h1 = soup.find('h1')
         if h1:
             return h1.get_text(strip=True)
@@ -152,27 +284,33 @@ class ScraperService:
                 text = heading.get_text(strip=True)
                 if text:
                     headings.append(f"{tag.upper()}: {text}")
-        return headings
+        return headings[:50]  # Limit to 50 headings
 
     def _extract_content(self, soup: BeautifulSoup) -> str:
-        """
-        Extract main content from the page.
+        """Extract main content from the page."""
+        # Clone soup to avoid modifying original
+        soup_copy = BeautifulSoup(str(soup), 'lxml')
 
-        Removes scripts, styles, and navigation elements.
-        """
         # Remove unwanted elements
-        for element in soup.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'noscript']):
+        for element in soup_copy.find_all([
+            'script', 'style', 'nav', 'header', 'footer',
+            'aside', 'noscript', 'iframe', 'form'
+        ]):
             element.decompose()
 
         # Try to find main content
-        main_content = soup.find('main') or soup.find('article') or soup.find('div', {'class': re.compile(r'content|main', re.I)})
+        main_content = (
+            soup_copy.find('main') or
+            soup_copy.find('article') or
+            soup_copy.find('div', {'class': re.compile(r'content|main|body', re.I)}) or
+            soup_copy.find('div', {'id': re.compile(r'content|main|body', re.I)})
+        )
 
         if main_content:
             text = main_content.get_text(separator='\n', strip=True)
         else:
-            # Fallback to body
-            body = soup.find('body')
-            text = body.get_text(separator='\n', strip=True) if body else soup.get_text(separator='\n', strip=True)
+            body = soup_copy.find('body')
+            text = body.get_text(separator='\n', strip=True) if body else soup_copy.get_text(separator='\n', strip=True)
 
         # Clean up whitespace
         lines = [line.strip() for line in text.split('\n') if line.strip()]
@@ -186,102 +324,24 @@ class ScraperService:
         return content
 
 
-class Crawl4AIScraperService:
+def create_scraper(
+    mode: CrawlMode,
+    respect_robots: bool = True,
+    use_rate_limiting: bool = True,
+) -> ScraperService:
     """
-    Alternative scraper service using Crawl4AI library.
-
-    Note: Requires crawl4ai to be installed and configured.
-    """
-
-    def __init__(self, mode: CrawlMode):
-        """
-        Initialize the Crawl4AI scraper service.
-
-        Args:
-            mode: Crawl execution mode
-        """
-        self.mode = mode
-        self._crawler = None
-
-    async def _get_crawler(self):
-        """Get or create the Crawl4AI crawler."""
-        if self._crawler is None:
-            try:
-                from crawl4ai import AsyncWebCrawler
-                self._crawler = AsyncWebCrawler(verbose=False)
-                await self._crawler.start()
-            except ImportError:
-                raise ImportError("crawl4ai is not installed. Run: pip install crawl4ai")
-        return self._crawler
-
-    async def close(self):
-        """Close the Crawl4AI crawler."""
-        if self._crawler:
-            await self._crawler.close()
-            self._crawler = None
-
-    async def fetch_page(self, task: URLTask) -> tuple[PageResult, list[str]]:
-        """
-        Fetch and process a page using Crawl4AI.
-
-        Args:
-            task: URL task to process
-
-        Returns:
-            Tuple of (PageResult, discovered_urls)
-        """
-        timer = PageTimer()
-        timer.start()
-
-        discovered_urls: list[str] = []
-        result = PageResult(
-            url=task.url,
-            parent_url=task.parent_url,
-            depth=task.depth,
-        )
-
-        try:
-            crawler = await self._get_crawler()
-            crawl_result = await crawler.arun(url=task.url)
-
-            if crawl_result.success:
-                # Extract links
-                discovered_urls = crawl_result.links.get("internal", [])
-                result.links_found = len(discovered_urls)
-
-                # Extract content if scraping
-                if self.mode in (CrawlMode.ONLY_SCRAPE, CrawlMode.CRAWL_SCRAPE):
-                    result.title = crawl_result.metadata.get("title")
-                    result.content = crawl_result.markdown or crawl_result.cleaned_html
-
-                    # Extract headings from markdown
-                    if crawl_result.markdown:
-                        headings = []
-                        for line in crawl_result.markdown.split('\n'):
-                            if line.startswith('#'):
-                                headings.append(line.strip())
-                        result.headings = headings[:20]  # Limit headings
-            else:
-                result.error = crawl_result.error_message or "Crawl failed"
-
-        except Exception as e:
-            result.error = f"Crawl4AI error: {str(e)}"
-
-        result.timing_ms = timer.stop()
-        return result, discovered_urls
-
-
-def create_scraper(mode: CrawlMode, use_crawl4ai: bool = False) -> ScraperService | Crawl4AIScraperService:
-    """
-    Factory function to create appropriate scraper.
+    Factory function to create scraper service.
 
     Args:
         mode: Crawl execution mode
-        use_crawl4ai: If True, use Crawl4AI; otherwise use basic scraper
+        respect_robots: Whether to check robots.txt
+        use_rate_limiting: Whether to use rate limiting
 
     Returns:
-        Scraper service instance
+        ScraperService instance
     """
-    if use_crawl4ai:
-        return Crawl4AIScraperService(mode)
-    return ScraperService(mode)
+    return ScraperService(
+        mode=mode,
+        respect_robots=respect_robots,
+        use_rate_limiting=use_rate_limiting,
+    )

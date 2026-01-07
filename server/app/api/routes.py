@@ -33,6 +33,8 @@ async def start_crawl(request: CrawlRequest, background_tasks: BackgroundTasks):
         "mode": request.mode.value,
         "max_depth": request.max_depth,
         "worker_count": request.worker_count,
+        "allow_subdomains": request.allow_subdomains,
+        "allowed_domains": request.allowed_domains,
     }
 
 
@@ -58,6 +60,8 @@ async def get_status(job_id: str):
         "mode": status.mode.value,
         "max_depth": status.max_depth,
         "worker_count": status.worker_count,
+        "allow_subdomains": status.allow_subdomains,
+        "allowed_domains": status.allowed_domains,
         "current_depth": status.current_depth,
         "urls_discovered": status.urls_discovered,
         "urls_processed": status.urls_processed,
@@ -110,6 +114,8 @@ async def get_results(job_id: str):
         "mode": result.mode.value,
         "max_depth": result.max_depth,
         "worker_count": result.worker_count,
+        "allow_subdomains": result.allow_subdomains,
+        "allowed_domains": result.allowed_domains,
         "state": result.state.value,
         "timing": OutputFormatter.format_timing_breakdown(result.timing),
         "summary": OutputFormatter.create_summary(

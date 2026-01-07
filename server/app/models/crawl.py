@@ -24,6 +24,8 @@ class CrawlRequest(BaseModel):
     mode: CrawlMode = Field(default=CrawlMode.CRAWL_SCRAPE, description="Crawl execution mode")
     max_depth: int = Field(default=3, ge=1, le=5, description="Maximum crawl depth (1-5)")
     worker_count: int = Field(default=4, ge=2, le=10, description="Number of concurrent workers (2-10)")
+    allow_subdomains: bool = Field(default=False, description="Allow crawling subdomains")
+    allowed_domains: list[str] = Field(default_factory=list, description="Additional allowed domains")
 
 
 class TimingMetrics(BaseModel):
@@ -62,6 +64,8 @@ class CrawlStatus(BaseModel):
     mode: CrawlMode = Field(..., description="Execution mode")
     max_depth: int = Field(..., description="Maximum depth setting")
     worker_count: int = Field(..., description="Number of workers")
+    allow_subdomains: bool = Field(default=False, description="Allow crawling subdomains")
+    allowed_domains: list[str] = Field(default_factory=list, description="Additional allowed domains")
     current_depth: int = Field(default=0, description="Current BFS depth being processed")
     urls_discovered: int = Field(default=0, description="Total URLs discovered")
     urls_processed: int = Field(default=0, description="URLs processed so far")
@@ -77,6 +81,8 @@ class CrawlResult(BaseModel):
     mode: CrawlMode = Field(..., description="Execution mode")
     max_depth: int = Field(..., description="Maximum depth setting")
     worker_count: int = Field(..., description="Number of workers used")
+    allow_subdomains: bool = Field(default=False, description="Allow crawling subdomains")
+    allowed_domains: list[str] = Field(default_factory=list, description="Additional allowed domains")
     state: CrawlState = Field(..., description="Final job state")
     timing: TimingMetrics = Field(..., description="Complete timing breakdown")
     urls_by_depth: list[DepthStats] = Field(default_factory=list, description="URLs grouped by depth")

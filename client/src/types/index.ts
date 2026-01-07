@@ -7,6 +7,8 @@ export interface CrawlRequest {
   mode: CrawlMode;
   max_depth: number;
   worker_count: number;
+  allow_subdomains?: boolean;
+  allowed_domains?: string[];
 }
 
 export interface TimingMetrics {
@@ -43,6 +45,8 @@ export interface CrawlStatus {
   mode: CrawlMode;
   max_depth: number;
   worker_count: number;
+  allow_subdomains: boolean;
+  allowed_domains: string[];
   current_depth: number;
   urls_discovered: number;
   urls_processed: number;
@@ -68,6 +72,8 @@ export interface CrawlResults {
   mode: CrawlMode;
   max_depth: number;
   worker_count: number;
+  allow_subdomains: boolean;
+  allowed_domains: string[];
   state: CrawlState;
   timing: TimingMetrics;
   summary: CrawlSummary;
@@ -82,4 +88,6 @@ export interface StartCrawlResponse {
   mode: CrawlMode;
   max_depth: number;
   worker_count: number;
+  allow_subdomains: boolean;
+  allowed_domains: string[];
 }
