@@ -14,10 +14,13 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from ..models.crawl import URLTask, PageResult, CrawlMode
+from ..utils.logger import get_scraper_logger
 from .timer import PageTimer
 from .rate_limiter import rate_limiter
 from .robots import robots_checker
 
+# Initialize logger
+logger = get_scraper_logger()
 
 # User agent pool for rotation
 USER_AGENTS = [
@@ -127,6 +130,8 @@ class ScraperService:
         timer = PageTimer()
         timer.start()
 
+        logger.debug(f"[FETCH] Starting: {task.url} (depth={task.depth})")
+
         discovered_urls: list[str] = []
         result = PageResult(
             url=task.url,
@@ -139,6 +144,7 @@ class ScraperService:
             try:
                 can_fetch = await robots_checker.can_fetch(task.url)
                 if not can_fetch:
+                    logger.warning(f"[ROBOTS] Blocked by robots.txt: {task.url}")
                     result.error = "Blocked by robots.txt"
                     result.timing_ms = timer.stop()
                     return result, discovered_urls
@@ -147,12 +153,14 @@ class ScraperService:
                 crawl_delay = robots_checker.get_crawl_delay(task.url)
                 if crawl_delay > 0:
                     domain = urlparse(task.url).netloc
+                    logger.debug(f"[ROBOTS] Crawl delay {crawl_delay}s for {domain}")
                     rate_limiter.set_delay(domain, crawl_delay)
-            except Exception:
-                pass  # Continue if robots check fails
+            except Exception as e:
+                logger.debug(f"[ROBOTS] Check failed for {task.url}: {e}")
 
         # Apply rate limiting
         if self.use_rate_limiting:
+            logger.debug(f"[RATE_LIMIT] Acquiring for {task.url}")
             await rate_limiter.acquire(task.url)
 
         # Fetch with retries
@@ -187,7 +195,11 @@ class ScraperService:
                 # Rotate user agent per request
                 headers = {"User-Agent": get_random_user_agent()}
 
+                logger.debug(f"[HTTP] Request attempt {attempt + 1}/{self.max_retries}: {task.url}")
+
                 async with session.get(task.url, headers=headers) as response:
+                    logger.info(f"[HTTP] Response {response.status}: {task.url}")
+
                     if response.status == 200:
                         html = await response.text()
                         soup = BeautifulSoup(html, 'lxml')
@@ -195,17 +207,20 @@ class ScraperService:
                         # Extract links
                         discovered_urls = self._extract_links(soup, task.url)
                         result.links_found = len(discovered_urls)
+                        logger.debug(f"[LINKS] Found {len(discovered_urls)} links on {task.url}")
 
                         # Extract content if scraping enabled
                         if self.mode in (CrawlMode.ONLY_SCRAPE, CrawlMode.CRAWL_SCRAPE):
                             result.title = self._extract_title(soup)
                             result.headings = self._extract_headings(soup)
                             result.content = self._extract_content(soup)
+                            logger.debug(f"[SCRAPE] Extracted content from {task.url} (title: {result.title})")
 
                         return result, discovered_urls
 
                     elif response.status == 429:
                         # Rate limited - wait longer
+                        logger.warning(f"[HTTP] Rate limited (429): {task.url}, waiting {delays[attempt] * 2}s")
                         result.error = f"Rate limited (429)"
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(delays[attempt] * 2)
@@ -213,6 +228,7 @@ class ScraperService:
 
                     elif response.status >= 500:
                         # Server error - retry
+                        logger.warning(f"[HTTP] Server error {response.status}: {task.url}, retrying...")
                         last_error = f"HTTP {response.status}"
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(delays[attempt])
@@ -220,23 +236,28 @@ class ScraperService:
 
                     else:
                         # Client error - don't retry
+                        logger.error(f"[HTTP] Client error {response.status}: {task.url}")
                         result.error = f"HTTP {response.status}"
                         return result, discovered_urls
 
             except asyncio.TimeoutError:
+                logger.warning(f"[HTTP] Timeout on attempt {attempt + 1}: {task.url}")
                 last_error = "Request timeout"
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(delays[attempt])
 
             except aiohttp.ClientError as e:
+                logger.warning(f"[HTTP] Client error on attempt {attempt + 1}: {task.url} - {e}")
                 last_error = f"Client error: {str(e)}"
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(delays[attempt])
 
             except Exception as e:
+                logger.error(f"[HTTP] Unexpected error: {task.url} - {e}")
                 last_error = f"Unexpected error: {str(e)}"
                 break  # Don't retry on unexpected errors
 
+        logger.error(f"[HTTP] All retries failed for {task.url}: {last_error}")
         result.error = last_error
         return result, discovered_urls
 

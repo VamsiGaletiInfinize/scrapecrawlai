@@ -14,10 +14,15 @@ from ..models.crawl import (
     CrawlRequest, CrawlResult, CrawlStatus, CrawlState, CrawlMode,
     TimingMetrics, DepthStats, PageResult, URLTask
 )
+from ..utils.logger import get_crawler_logger
 from .timer import TimerService
 from .scraper import ScraperService
 from .worker_pool import WorkerPool
 from .formatter import OutputFormatter
+from .websocket import connection_manager
+
+# Initialize logger
+logger = get_crawler_logger()
 
 
 def get_root_domain(netloc: str) -> str:
@@ -193,6 +198,7 @@ class JobManager:
         )
 
         self._jobs[job_id] = status
+        logger.info(f"[JOB] Created job {job_id}: {request.seed_url} (mode={request.mode.value}, depth={request.max_depth}, workers={request.worker_count})")
         return job_id
 
     def get_status(self, job_id: str) -> Optional[CrawlStatus]:
@@ -233,6 +239,15 @@ class JobManager:
             # Update state to running
             status.state = CrawlState.RUNNING
             timer.start_total()
+            logger.info(f"[JOB] Starting job {job_id}: {status.seed_url}")
+
+            # Broadcast job started
+            await connection_manager.broadcast_status_update(job_id, {
+                "state": status.state.value,
+                "urls_discovered": 0,
+                "urls_processed": 0,
+                "current_depth": 0,
+            })
 
             # Create scraper service with enhancements
             scraper = ScraperService(
@@ -241,10 +256,21 @@ class JobManager:
                 use_rate_limiting=True,
             )
 
-            # Create worker pool
+            # Progress callback for real-time updates
+            async def on_progress(progress: dict):
+                await connection_manager.broadcast_status_update(job_id, {
+                    "state": status.state.value,
+                    "urls_discovered": progress["urls_discovered"],
+                    "urls_processed": progress["urls_processed"],
+                    "current_depth": progress["current_depth"],
+                    "queue_size": progress.get("queue_size", 0),
+                })
+
+            # Create worker pool with progress callback
             worker_pool = WorkerPool(
                 num_workers=status.worker_count,
                 process_callback=scraper.fetch_page,
+                progress_callback=on_progress,
             )
 
             # Get base domain for BFS
@@ -319,6 +345,21 @@ class JobManager:
             self._results[job_id] = result
             status.state = CrawlState.COMPLETED
 
+            logger.info(f"[JOB] Completed job {job_id}: {status.urls_discovered} URLs discovered, {status.urls_processed} pages processed in {timer.total_ms:.2f}ms")
+
+            # Broadcast job completed
+            await connection_manager.broadcast_job_completed(job_id, {
+                "state": status.state.value,
+                "urls_discovered": status.urls_discovered,
+                "urls_processed": status.urls_processed,
+                "current_depth": status.current_depth,
+                "timing": {
+                    "total_ms": status.timing.total_ms,
+                    "crawling_ms": status.timing.crawling_ms,
+                    "scraping_ms": status.timing.scraping_ms,
+                },
+            })
+
             # Close scraper
             await scraper.close()
 
@@ -327,6 +368,10 @@ class JobManager:
             status.state = CrawlState.FAILED
             status.error = str(e)
             status.timing.total_ms = timer.total_ms
+            logger.error(f"[JOB] Failed job {job_id}: {e}")
+
+            # Broadcast job failed
+            await connection_manager.broadcast_job_failed(job_id, str(e))
 
     def get_json_output(self, job_id: str) -> Optional[str]:
         """Get JSON formatted output for a job."""

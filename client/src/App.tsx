@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 import { CrawlForm, StatusPanel, ResultsDashboard } from './components';
-import { startCrawl, getCrawlStatus, getCrawlResults } from './services/api';
+import { startCrawl, getCrawlResults } from './services/api';
+import { useWebSocket } from './hooks';
 import type { CrawlRequest, CrawlStatus, CrawlResults } from './types';
 
 function App() {
@@ -11,63 +12,81 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
+  const [wsConnected, setWsConnected] = useState(false);
 
-  const pollingRef = useRef<number | null>(null);
   const timerRef = useRef<number | null>(null);
   const startTimeRef = useRef<number>(0);
+  const currentJobIdRef = useRef<string | null>(null);
 
-  const stopPolling = useCallback(() => {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
+  // WebSocket hook for real-time updates
+  const { connect, disconnect, isConnected } = useWebSocket({
+    onStatusUpdate: (wsStatus) => {
+      setStatus((prev) => prev ? {
+        ...prev,
+        state: wsStatus.state,
+        urls_discovered: wsStatus.urls_discovered,
+        urls_processed: wsStatus.urls_processed,
+        current_depth: wsStatus.current_depth,
+      } : null);
+    },
+    onCompleted: async (wsStatus) => {
+      // Stop timer
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+
+      // Update status
+      setStatus((prev) => prev ? {
+        ...prev,
+        state: 'completed',
+        urls_discovered: wsStatus.urls_discovered,
+        urls_processed: wsStatus.urls_processed,
+        current_depth: wsStatus.current_depth,
+      } : null);
+
+      // Fetch full results
+      if (currentJobIdRef.current) {
+        try {
+          const crawlResults = await getCrawlResults(currentJobIdRef.current);
+          setResults(crawlResults);
+          setElapsedTime(crawlResults.timing.total_ms);
+        } catch (err) {
+          console.error('Error fetching results:', err);
+        }
+      }
+    },
+    onFailed: (errorMsg) => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      setError(errorMsg);
+    },
+    onConnected: () => setWsConnected(true),
+    onDisconnected: () => setWsConnected(false),
+  });
+
+  const stopTimers = useCallback(() => {
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
   }, []);
 
-  const pollStatus = useCallback(async (id: string) => {
-    try {
-      const currentStatus = await getCrawlStatus(id);
-      setStatus(currentStatus);
-
-      if (currentStatus.state === 'completed') {
-        stopPolling();
-        const crawlResults = await getCrawlResults(id);
-        setResults(crawlResults);
-        setElapsedTime(currentStatus.timing.total_ms);
-      } else if (currentStatus.state === 'failed') {
-        stopPolling();
-        setError(currentStatus.error || 'Crawl failed');
-      }
-    } catch (err) {
-      console.error('Error polling status:', err);
-    }
-  }, [stopPolling]);
-
-  const startPolling = useCallback((id: string) => {
+  const startTimers = useCallback(() => {
     startTimeRef.current = Date.now();
-
-    // Start elapsed time timer
     timerRef.current = window.setInterval(() => {
       setElapsedTime(Date.now() - startTimeRef.current);
     }, 100);
-
-    // Start status polling
-    pollingRef.current = window.setInterval(() => {
-      pollStatus(id);
-    }, 1500);
-
-    // Initial poll
-    pollStatus(id);
-  }, [pollStatus]);
+  }, []);
 
   useEffect(() => {
     return () => {
-      stopPolling();
+      stopTimers();
+      disconnect();
     };
-  }, [stopPolling]);
+  }, [stopTimers, disconnect]);
 
   const handleSubmit = async (request: CrawlRequest) => {
     setIsLoading(true);
@@ -79,7 +98,31 @@ function App() {
     try {
       const response = await startCrawl(request);
       setJobId(response.job_id);
-      startPolling(response.job_id);
+      currentJobIdRef.current = response.job_id;
+
+      // Initialize status with request data
+      setStatus({
+        job_id: response.job_id,
+        state: 'pending',
+        seed_url: response.seed_url,
+        mode: response.mode,
+        max_depth: response.max_depth,
+        worker_count: response.worker_count,
+        allow_subdomains: response.allow_subdomains,
+        allowed_domains: response.allowed_domains,
+        current_depth: 0,
+        urls_discovered: 0,
+        urls_processed: 0,
+        urls_by_depth: [],
+        timing: { url_discovery_ms: 0, crawling_ms: 0, scraping_ms: 0, total_ms: 0 },
+        error: null,
+      });
+
+      // Start elapsed time timer
+      startTimers();
+
+      // Connect to WebSocket for real-time updates
+      connect(response.job_id);
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to start crawl';
       setError(errorMessage);
@@ -89,7 +132,9 @@ function App() {
   };
 
   const handleNewCrawl = () => {
-    stopPolling();
+    stopTimers();
+    disconnect();
+    currentJobIdRef.current = null;
     setJobId(null);
     setStatus(null);
     setResults(null);
@@ -119,7 +164,14 @@ function App() {
         )}
 
         {status && !results && (
-          <StatusPanel status={status} elapsedTime={elapsedTime} />
+          <>
+            {wsConnected && (
+              <div className="ws-indicator connected">
+                <span className="ws-dot"></span> Live Updates Connected
+              </div>
+            )}
+            <StatusPanel status={status} elapsedTime={elapsedTime} />
+          </>
         )}
 
         {results && (

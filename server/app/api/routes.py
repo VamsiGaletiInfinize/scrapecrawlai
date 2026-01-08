@@ -1,10 +1,16 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, JSONResponse
 from typing import Optional
+import asyncio
 
 from ..models.crawl import CrawlRequest, CrawlStatus, CrawlResult, CrawlState
 from ..services.job_manager import job_manager
 from ..services.formatter import OutputFormatter
+from ..services.websocket import connection_manager
+from ..utils.logger import get_api_logger
+
+# Initialize logger
+logger = get_api_logger()
 
 router = APIRouter(prefix="/api", tags=["crawl"])
 
@@ -20,11 +26,15 @@ async def start_crawl(request: CrawlRequest, background_tasks: BackgroundTasks):
     Returns:
         Job ID for tracking progress
     """
+    logger.info(f"[API] POST /start-crawl - seed_url={request.seed_url}, mode={request.mode.value}")
+
     # Create job
     job_id = job_manager.create_job(request)
 
     # Start job in background
     background_tasks.add_task(job_manager.start_job, job_id)
+
+    logger.info(f"[API] Job created: {job_id}")
 
     return {
         "job_id": job_id,
@@ -230,3 +240,54 @@ async def delete_job(job_id: str):
     if job_manager.delete_job(job_id):
         return {"message": f"Job {job_id} deleted"}
     raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+
+@router.websocket("/ws/{job_id}")
+async def websocket_endpoint(websocket: WebSocket, job_id: str):
+    """
+    WebSocket endpoint for real-time job updates.
+
+    Clients connect to receive live status updates for a specific job.
+    Messages sent:
+    - status_update: Periodic progress updates during crawl
+    - job_completed: Final status when job finishes successfully
+    - job_failed: Error information if job fails
+    """
+    await connection_manager.connect(websocket, job_id)
+
+    try:
+        # Send initial status if job exists
+        status = job_manager.get_status(job_id)
+        if status:
+            await websocket.send_json({
+                "type": "initial_status",
+                "job_id": job_id,
+                "data": {
+                    "state": status.state.value,
+                    "urls_discovered": status.urls_discovered,
+                    "urls_processed": status.urls_processed,
+                    "current_depth": status.current_depth,
+                }
+            })
+
+        # Keep connection alive and listen for client messages
+        while True:
+            try:
+                # Wait for any message (ping/pong or close)
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                # Echo back ping messages
+                if data == "ping":
+                    await websocket.send_text("pong")
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                try:
+                    await websocket.send_json({"type": "heartbeat"})
+                except Exception:
+                    break
+
+    except WebSocketDisconnect:
+        logger.info(f"[WS] Client disconnected from job {job_id}")
+    except Exception as e:
+        logger.error(f"[WS] Error in websocket for job {job_id}: {e}")
+    finally:
+        await connection_manager.disconnect(websocket)

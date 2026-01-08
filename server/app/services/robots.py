@@ -6,10 +6,16 @@ ethical crawling behavior.
 """
 
 import asyncio
+import time
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 from typing import Optional
 import aiohttp
+
+from ..utils.logger import get_robots_logger
+
+# Initialize logger
+logger = get_robots_logger()
 
 
 class RobotsChecker:
@@ -36,7 +42,8 @@ class RobotsChecker:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=10)
+            # 5 second timeout for robots.txt (fast fail)
+            timeout = aiohttp.ClientTimeout(total=5, connect=3)
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
@@ -61,13 +68,18 @@ class RobotsChecker:
         parser = RobotFileParser()
         parser.set_url(robots_url)
 
+        start_time = time.perf_counter()
+
         try:
             session = await self._get_session()
             async with session.get(robots_url) as response:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+
                 if response.status == 200:
                     content = await response.text()
                     # Parse the robots.txt content
                     parser.parse(content.splitlines())
+                    logger.info(f"[ROBOTS] Loaded {robots_url} in {elapsed_ms:.1f}ms (status=200)")
 
                     # Extract crawl-delay if present
                     for line in content.splitlines():
@@ -76,14 +88,22 @@ class RobotsChecker:
                             try:
                                 delay = float(line.split(':', 1)[1].strip())
                                 self._crawl_delays[domain] = delay
+                                logger.debug(f"[ROBOTS] Crawl-delay={delay}s for {domain}")
                             except (ValueError, IndexError):
                                 pass
                 else:
                     # If robots.txt doesn't exist or error, allow all
                     parser.allow_all = True
-        except Exception:
+                    logger.debug(f"[ROBOTS] No robots.txt for {domain} (status={response.status}) in {elapsed_ms:.1f}ms")
+        except asyncio.TimeoutError:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            parser.allow_all = True
+            logger.warning(f"[ROBOTS] Timeout for {domain} after {elapsed_ms:.1f}ms - allowing all")
+        except Exception as e:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
             # On any error, allow all (fail open)
             parser.allow_all = True
+            logger.debug(f"[ROBOTS] Error for {domain}: {e} ({elapsed_ms:.1f}ms) - allowing all")
 
         self._parsers[domain] = parser
 

@@ -18,6 +18,7 @@ class WorkerPool:
         self,
         num_workers: int,
         process_callback: Callable[[URLTask], Awaitable[tuple[PageResult, list[str]]]],
+        progress_callback: Callable[[dict], Awaitable[None]] | None = None,
     ):
         """
         Initialize the worker pool.
@@ -25,9 +26,11 @@ class WorkerPool:
         Args:
             num_workers: Maximum number of concurrent workers (2-10)
             process_callback: Async function to process a single URL
+            progress_callback: Optional async function to report progress
         """
         self.num_workers = max(2, min(10, num_workers))
         self.process_callback = process_callback
+        self.progress_callback = progress_callback
         self.semaphore = asyncio.Semaphore(self.num_workers)
 
         # Shared state
@@ -35,6 +38,11 @@ class WorkerPool:
         self.visited: set[str] = set()
         self.urls_by_depth: dict[int, list[str]] = {}
         self.lock = asyncio.Lock()
+
+        # Progress tracking
+        self._total_to_process = 0
+        self._current_depth = 0
+        self._queue_size = 0
 
         # Timing metrics
         self.timing = TimingMetrics()
@@ -45,6 +53,7 @@ class WorkerPool:
         self,
         task: URLTask,
         results_list: list[tuple[PageResult, list[str]]],
+        on_url_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """
         Process a single URL with semaphore-controlled concurrency.
@@ -52,6 +61,7 @@ class WorkerPool:
         Args:
             task: URL task to process
             results_list: Shared list to append results
+            on_url_complete: Optional callback when URL processing completes
         """
         async with self.semaphore:
             start_time = time.perf_counter()
@@ -61,6 +71,10 @@ class WorkerPool:
                 # Store result
                 async with self.lock:
                     results_list.append((result, discovered_urls))
+
+                # Notify completion
+                if on_url_complete:
+                    await on_url_complete()
 
             except Exception as e:
                 # Create error result
@@ -74,15 +88,21 @@ class WorkerPool:
                 async with self.lock:
                     results_list.append((result, []))
 
+                # Notify completion even on error
+                if on_url_complete:
+                    await on_url_complete()
+
     async def process_batch(
         self,
         tasks: list[URLTask],
+        on_url_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> list[tuple[PageResult, list[str]]]:
         """
         Process a batch of URLs concurrently using the worker pool.
 
         Args:
             tasks: List of URL tasks to process
+            on_url_complete: Optional callback when each URL completes
 
         Returns:
             List of (PageResult, discovered_urls) tuples
@@ -91,7 +111,7 @@ class WorkerPool:
 
         # Create tasks for all URLs
         async_tasks = [
-            asyncio.create_task(self._process_url(task, results_list))
+            asyncio.create_task(self._process_url(task, results_list, on_url_complete))
             for task in tasks
         ]
 
@@ -146,6 +166,10 @@ class WorkerPool:
 
         # BFS traversal with worker pool
         current_depth = 1
+        # Track total URLs to process for progress calculation
+        self._total_to_process = len(queue)
+        self._current_depth = current_depth
+
         while queue:
             # Collect all tasks at current depth
             current_level_tasks: list[URLTask] = []
@@ -155,12 +179,27 @@ class WorkerPool:
             if not current_level_tasks:
                 if queue:
                     current_depth = queue[0].depth
+                    self._current_depth = current_depth
                     continue
                 break
 
+            # Update progress tracking
+            self._current_depth = current_depth
+            self._queue_size = len(queue)
+
+            # Create per-URL progress callback using instance variables
+            async def on_url_complete():
+                if self.progress_callback:
+                    await self.progress_callback({
+                        "urls_discovered": self._total_to_process,
+                        "urls_processed": len(self.results),
+                        "current_depth": self._current_depth,
+                        "queue_size": self._queue_size,
+                    })
+
             # Process current level with worker pool
             crawl_start = time.perf_counter()
-            batch_results = await self.process_batch(current_level_tasks)
+            batch_results = await self.process_batch(current_level_tasks, on_url_complete)
             crawl_time = (time.perf_counter() - crawl_start) * 1000
 
             # Track timing
@@ -207,6 +246,19 @@ class WorkerPool:
                             self.urls_by_depth[next_depth].append(normalized)
 
             self.timing.url_discovery_ms += (time.perf_counter() - discovery_start) * 1000
+
+            # Update total to process with newly discovered URLs
+            self._total_to_process = len(self.results) + len(queue)
+            self._queue_size = len(queue)
+
+            # Report progress after depth completion
+            if self.progress_callback:
+                await self.progress_callback({
+                    "urls_discovered": self._total_to_process,
+                    "urls_processed": len(self.results),
+                    "current_depth": current_depth,
+                    "queue_size": len(queue),
+                })
 
             # Move to next depth
             current_depth += 1
