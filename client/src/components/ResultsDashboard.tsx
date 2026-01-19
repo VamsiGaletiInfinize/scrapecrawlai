@@ -1,5 +1,7 @@
+import { useState } from 'react';
 import type { CrawlResults } from '../types';
 import { TimingBreakdown } from './TimingBreakdown';
+import { ExportPanel } from './ExportPanel';
 import { getDownloadUrl } from '../services/api';
 
 interface ResultsDashboardProps {
@@ -7,6 +9,8 @@ interface ResultsDashboardProps {
 }
 
 export function ResultsDashboard({ results }: ResultsDashboardProps) {
+  const [showExportPanel, setShowExportPanel] = useState(false);
+
   const handleDownload = (format: 'json' | 'markdown') => {
     window.open(getDownloadUrl(results.job_id, format), '_blank');
   };
@@ -22,8 +26,16 @@ export function ResultsDashboard({ results }: ResultsDashboardProps) {
           <button onClick={() => handleDownload('markdown')} className="download-btn markdown">
             Download Markdown
           </button>
+          <button
+            onClick={() => setShowExportPanel(!showExportPanel)}
+            className={`download-btn export ${showExportPanel ? 'active' : ''}`}
+          >
+            {showExportPanel ? 'Hide' : 'Advanced'} Export
+          </button>
         </div>
       </div>
+
+      {showExportPanel && <ExportPanel jobId={results.job_id} />}
 
       <div className="results-summary">
         <div className="summary-card">
@@ -42,6 +54,12 @@ export function ResultsDashboard({ results }: ResultsDashboardProps) {
           <span className="summary-value">{results.summary.scraped_pages}</span>
           <span className="summary-label">Scraped</span>
         </div>
+        {results.summary.skipped_pages !== undefined && results.summary.skipped_pages > 0 && (
+          <div className="summary-card skipped">
+            <span className="summary-value">{results.summary.skipped_pages}</span>
+            <span className="summary-label">Skipped</span>
+          </div>
+        )}
         <div className="summary-card">
           <span className="summary-value">{results.summary.total_links_found}</span>
           <span className="summary-label">Links Found</span>
@@ -51,6 +69,49 @@ export function ResultsDashboard({ results }: ResultsDashboardProps) {
           <span className="summary-label">Avg Time/Page</span>
         </div>
       </div>
+
+      {/* Enhanced Failure Breakdown */}
+      {results.summary.failure_breakdown && results.summary.failure_breakdown.total_failures > 0 && (
+        <div className="failure-breakdown-section">
+          <h3>Failure Breakdown</h3>
+          <div className="failure-cards">
+            <div className="failure-card crawl-failure">
+              <span className="failure-value">{results.summary.failure_breakdown.crawl_failures}</span>
+              <span className="failure-label">Crawl Failures</span>
+              <span className="failure-desc">HTTP/Network errors</span>
+            </div>
+            <div className="failure-card scrape-failure">
+              <span className="failure-value">{results.summary.failure_breakdown.scrape_failures}</span>
+              <span className="failure-label">Scrape Failures</span>
+              <span className="failure-desc">Content extraction errors</span>
+            </div>
+            <div className="failure-card total-failure">
+              <span className="failure-value">{results.summary.failure_breakdown.total_failures}</span>
+              <span className="failure-label">Total Failures</span>
+              <span className="failure-desc">
+                {((results.summary.failure_breakdown.total_failures / results.summary.total_pages) * 100).toFixed(1)}% failure rate
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Enhanced Timing Breakdown */}
+      {results.summary.timing_breakdown && (
+        <div className="timing-breakdown-section">
+          <h3>Per-Page Timing Averages</h3>
+          <div className="timing-avg-cards">
+            <div className="timing-avg-card">
+              <span className="timing-value">{results.summary.timing_breakdown.avg_crawl_per_page_ms.toFixed(1)}ms</span>
+              <span className="timing-label">Avg Crawl/Page</span>
+            </div>
+            <div className="timing-avg-card">
+              <span className="timing-value">{results.summary.timing_breakdown.avg_scrape_per_page_ms.toFixed(1)}ms</span>
+              <span className="timing-label">Avg Scrape/Page</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       <TimingBreakdown timing={results.timing} />
 
@@ -98,7 +159,20 @@ export function ResultsDashboard({ results }: ResultsDashboardProps) {
             </thead>
             <tbody>
               {results.pages.map((page, idx) => (
-                <tr key={idx} className={page.error ? 'error-row' : ''}>
+                <tr
+                  key={idx}
+                  className={
+                    page.status === 'skipped'
+                      ? 'skipped-row'
+                      : page.failure?.phase === 'crawl'
+                      ? 'error-row crawl-error'
+                      : page.failure?.phase === 'scrape'
+                      ? 'error-row scrape-error'
+                      : page.error
+                      ? 'error-row'
+                      : ''
+                  }
+                >
                   <td className="url-cell">
                     <a href={page.url} target="_blank" rel="noopener noreferrer">
                       {page.url.length > 40 ? page.url.substring(0, 40) + '...' : page.url}
@@ -109,9 +183,36 @@ export function ResultsDashboard({ results }: ResultsDashboardProps) {
                     {page.title || '-'}
                   </td>
                   <td>{page.links_found}</td>
-                  <td>{page.timing_ms.toFixed(0)}ms</td>
-                  <td>
-                    {page.error ? (
+                  <td className="timing-cell">
+                    <span className="total-time">{page.timing_ms.toFixed(0)}ms</span>
+                    {page.timing && (
+                      <span className="timing-detail">
+                        (C: {page.timing.crawl_ms.toFixed(0)}ms / S: {page.timing.scrape_ms.toFixed(0)}ms)
+                      </span>
+                    )}
+                  </td>
+                  <td className="status-cell">
+                    {page.status === 'skipped' ? (
+                      <div className="skipped-info">
+                        <span className="status-skipped" title={page.skip_reason || 'Child pages disabled'}>
+                          Skipped
+                        </span>
+                        <span className="skip-reason">{page.skip_reason === 'child_pages_disabled' ? 'Child page' : page.skip_reason}</span>
+                      </div>
+                    ) : page.failure && page.failure.phase !== 'none' ? (
+                      <div className="failure-info">
+                        <span
+                          className={`status-error ${page.failure.phase}-failure-badge`}
+                          title={page.failure.reason || page.error || 'Unknown error'}
+                        >
+                          {page.failure.phase === 'crawl' ? 'Crawl' : 'Scrape'} Error
+                        </span>
+                        <span className="failure-type">{page.failure.type}</span>
+                        {page.failure.http_status && (
+                          <span className="http-status">HTTP {page.failure.http_status}</span>
+                        )}
+                      </div>
+                    ) : page.error ? (
                       <span className="status-error" title={page.error}>Error</span>
                     ) : page.has_content ? (
                       <span className="status-scraped">Scraped</span>

@@ -48,6 +48,7 @@ async def start_crawl(request: CrawlRequest, background_tasks: BackgroundTasks):
         "worker_count": request.worker_count,
         "allow_subdomains": request.allow_subdomains,
         "allowed_domains": request.allowed_domains,
+        "include_child_pages": request.include_child_pages,
     }
 
 

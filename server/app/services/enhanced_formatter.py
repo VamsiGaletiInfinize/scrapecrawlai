@@ -14,11 +14,13 @@ from datetime import datetime
 from typing import Optional
 from collections import defaultdict
 
-from ..models.crawl import CrawlResult, PageResult
+from ..models.crawl import CrawlResult, PageResult, FailurePhase
 from ..models.output import (
-    ContentType, OutputConfig, OutputFormat, OrganizationType,
-    PageMetadata, EnhancedPageResult, SubdomainGroup, DepthGroup,
-    ContentTypeGroup, CrawlMetadata, TimingBreakdown, OrganizedOutput,
+    ContentType, OutputConfig, OutputFormat, OrganizationType, PageCategory,
+    PageMetadata, PageTimingDetails, FailureDetails, EnhancedPageResult,
+    SubdomainGroup, DepthGroup, ContentTypeGroup,
+    SameDomainSuccessGroup, ExternalDomainGroup, ErrorGroup, FailureSummary,
+    ThreeGroupOutput, CrawlMetadata, TimingBreakdown, OrganizedOutput,
 )
 from .classifier import ContentClassifier, content_classifier
 
@@ -54,7 +56,7 @@ class EnhancedFormatter:
             OrganizedOutput with all groupings and metadata
         """
         # Convert pages to enhanced format
-        enhanced_pages = self._enhance_pages(result.pages)
+        enhanced_pages = self._enhance_pages(result.pages, result.seed_url)
 
         # Build metadata
         metadata = CrawlMetadata(
@@ -72,8 +74,11 @@ class EnhancedFormatter:
             total_errors=sum(1 for p in result.pages if p.error),
         )
 
-        # Build timing breakdown
+        # Build timing breakdown with separate crawl/scrape times
         page_times = [p.timing_ms for p in result.pages if p.timing_ms > 0]
+        crawl_times = [p.page_timing.crawl_ms for p in result.pages if p.page_timing.crawl_ms > 0]
+        scrape_times = [p.page_timing.scrape_ms for p in result.pages if p.page_timing.scrape_ms > 0]
+
         timing = TimingBreakdown(
             url_discovery_ms=result.timing.url_discovery_ms,
             crawling_ms=result.timing.crawling_ms,
@@ -89,8 +94,26 @@ class EnhancedFormatter:
         by_depth = self._group_by_depth(enhanced_pages)
         by_content_type = self._group_by_content_type(enhanced_pages)
 
+        # Build three-group organization (same-domain success, external, errors)
+        by_status = self._group_by_status(enhanced_pages)
+
         # Build summary
         summary = self._build_summary(enhanced_pages, by_subdomain, by_depth, by_content_type)
+
+        # Add timing breakdown to summary
+        summary['timing_breakdown'] = {
+            'avg_crawl_ms': round(sum(crawl_times) / len(crawl_times), 2) if crawl_times else 0,
+            'avg_scrape_ms': round(sum(scrape_times) / len(scrape_times), 2) if scrape_times else 0,
+            'total_crawl_ms': round(sum(crawl_times), 2),
+            'total_scrape_ms': round(sum(scrape_times), 2),
+        }
+
+        # Add failure breakdown to summary
+        summary['failure_breakdown'] = {
+            'crawl_failures': by_status.errors.crawl_failures,
+            'scrape_failures': by_status.errors.scrape_failures,
+            'time_wasted_ms': by_status.errors.total_time_wasted_ms,
+        }
 
         return OrganizedOutput(
             metadata=metadata,
@@ -99,15 +122,21 @@ class EnhancedFormatter:
             by_subdomain=by_subdomain,
             by_depth=by_depth,
             by_content_type=by_content_type,
+            by_status=by_status,
             all_pages=enhanced_pages,
         )
 
-    def _enhance_pages(self, pages: list[PageResult]) -> list[EnhancedPageResult]:
+    def _enhance_pages(
+        self,
+        pages: list[PageResult],
+        seed_domain: str = "",
+    ) -> list[EnhancedPageResult]:
         """
         Convert raw pages to enhanced format with metadata.
 
         Args:
             pages: List of raw page results
+            seed_domain: The seed URL's domain for same-domain classification
 
         Returns:
             List of enhanced page results
@@ -127,18 +156,50 @@ class EnhancedFormatter:
             # Calculate word count
             word_count = len(page.content.split()) if page.content else 0
 
+            # Build detailed timing info
+            timing_details = PageTimingDetails(
+                total_ms=page.page_timing.total_ms,
+                crawl_ms=page.page_timing.crawl_ms,
+                scrape_ms=page.page_timing.scrape_ms,
+                time_before_failure_ms=page.page_timing.time_before_failure_ms,
+            )
+
+            # Build failure details
+            failure_details = FailureDetails(
+                phase=page.failure.phase.value,
+                type=page.failure.type.value,
+                reason=page.failure.reason,
+                http_status=page.failure.http_status,
+            )
+
+            # Determine page category
+            has_error = page.error is not None or page.failure.phase != FailurePhase.NONE
+            is_external = not page.is_same_domain or page.is_subdomain
+
+            if has_error:
+                category = PageCategory.ERROR
+            elif is_external:
+                category = PageCategory.EXTERNAL_DOMAIN
+            else:
+                category = PageCategory.SAME_DOMAIN_SUCCESS
+
             metadata = PageMetadata(
                 url=page.url,
                 subdomain=subdomain,
                 depth=page.depth,
                 content_type=content_type,
+                category=category,
                 title=page.title,
                 parent_url=page.parent_url,
                 links_found=page.links_found,
                 timing_ms=page.timing_ms,
+                timing=timing_details,
                 word_count=word_count,
                 crawled_at=datetime.utcnow().isoformat() + "Z",
                 error=page.error,
+                failure=failure_details,
+                is_same_domain=page.is_same_domain,
+                is_subdomain=page.is_subdomain,
             )
 
             enhanced.append(EnhancedPageResult(
@@ -257,6 +318,155 @@ class EnhancedFormatter:
 
         return result
 
+    def _group_by_status(self, pages: list[EnhancedPageResult]) -> ThreeGroupOutput:
+        """
+        Group pages into three categories: same-domain success, external domain, and errors.
+
+        Args:
+            pages: List of enhanced pages
+
+        Returns:
+            ThreeGroupOutput with all three groups
+        """
+        same_domain_pages = []
+        external_pages = []
+        error_pages = []
+
+        # Categorize pages
+        for page in pages:
+            if page.metadata.category == PageCategory.ERROR:
+                error_pages.append(page)
+            elif page.metadata.category == PageCategory.EXTERNAL_DOMAIN:
+                external_pages.append(page)
+            else:
+                same_domain_pages.append(page)
+
+        # Build same-domain success group
+        same_domain_group = self._build_same_domain_group(same_domain_pages)
+
+        # Build external domain group
+        external_group = self._build_external_domain_group(external_pages)
+
+        # Build error group
+        error_group = self._build_error_group(error_pages)
+
+        return ThreeGroupOutput(
+            same_domain_success=same_domain_group,
+            external_domain=external_group,
+            errors=error_group,
+        )
+
+    def _build_same_domain_group(self, pages: list[EnhancedPageResult]) -> SameDomainSuccessGroup:
+        """Build the same-domain success group."""
+        if not pages:
+            return SameDomainSuccessGroup()
+
+        total_timing = sum(p.metadata.timing.total_ms for p in pages)
+        total_crawl = sum(p.metadata.timing.crawl_ms for p in pages)
+        total_scrape = sum(p.metadata.timing.scrape_ms for p in pages)
+        total_words = sum(p.metadata.word_count for p in pages)
+
+        depth_dist = defaultdict(int)
+        content_types = defaultdict(int)
+
+        for page in pages:
+            depth_dist[page.metadata.depth] += 1
+            content_types[page.metadata.content_type.value] += 1
+
+        return SameDomainSuccessGroup(
+            page_count=len(pages),
+            total_word_count=total_words,
+            avg_timing_ms=round(total_timing / len(pages), 2),
+            avg_crawl_ms=round(total_crawl / len(pages), 2),
+            avg_scrape_ms=round(total_scrape / len(pages), 2),
+            depth_distribution=dict(depth_dist),
+            content_types=dict(content_types),
+            pages=pages,
+        )
+
+    def _build_external_domain_group(self, pages: list[EnhancedPageResult]) -> ExternalDomainGroup:
+        """Build the external domain group."""
+        if not pages:
+            return ExternalDomainGroup()
+
+        domains = set()
+        subdomain_count = 0
+        external_count = 0
+        depth_dist = defaultdict(int)
+        status_dist = defaultdict(int)
+
+        for page in pages:
+            domains.add(page.metadata.subdomain)
+            depth_dist[page.metadata.depth] += 1
+
+            if page.metadata.is_subdomain:
+                subdomain_count += 1
+            else:
+                external_count += 1
+
+            if page.metadata.error:
+                status_dist['error'] += 1
+            else:
+                status_dist['success'] += 1
+
+        return ExternalDomainGroup(
+            page_count=len(pages),
+            domains=sorted(list(domains)),
+            subdomain_count=subdomain_count,
+            external_count=external_count,
+            depth_distribution=dict(depth_dist),
+            status_distribution=dict(status_dist),
+            pages=pages,
+        )
+
+    def _build_error_group(self, pages: list[EnhancedPageResult]) -> ErrorGroup:
+        """Build the error group with failure type breakdown."""
+        if not pages:
+            return ErrorGroup()
+
+        crawl_failures = 0
+        scrape_failures = 0
+        total_time_wasted = 0.0
+        depth_dist = defaultdict(int)
+        failure_type_map = defaultdict(lambda: {'count': 0, 'phase': '', 'urls': []})
+
+        for page in pages:
+            depth_dist[page.metadata.depth] += 1
+            total_time_wasted += page.metadata.timing.time_before_failure_ms or page.metadata.timing.total_ms
+
+            if page.metadata.failure.phase == 'crawl':
+                crawl_failures += 1
+            elif page.metadata.failure.phase == 'scrape':
+                scrape_failures += 1
+
+            # Track failure types
+            failure_type = page.metadata.failure.type
+            failure_type_map[failure_type]['count'] += 1
+            failure_type_map[failure_type]['phase'] = page.metadata.failure.phase
+            if len(failure_type_map[failure_type]['urls']) < 3:
+                failure_type_map[failure_type]['urls'].append(page.metadata.url)
+
+        # Build failure summaries
+        failure_summaries = [
+            FailureSummary(
+                type=ft,
+                count=data['count'],
+                phase=data['phase'],
+                example_urls=data['urls'],
+            )
+            for ft, data in sorted(failure_type_map.items(), key=lambda x: -x[1]['count'])
+        ]
+
+        return ErrorGroup(
+            page_count=len(pages),
+            crawl_failures=crawl_failures,
+            scrape_failures=scrape_failures,
+            total_time_wasted_ms=round(total_time_wasted, 2),
+            failure_types=failure_summaries,
+            depth_distribution=dict(depth_dist),
+            pages=pages,
+        )
+
     def _build_summary(
         self,
         pages: list[EnhancedPageResult],
@@ -330,6 +540,8 @@ class EnhancedFormatter:
             output['by_content_type'] = [
                 self._serialize_content_type_group(g, config) for g in organized.by_content_type
             ]
+        elif config.organization == OrganizationType.BY_STATUS:
+            output['by_status'] = self._serialize_three_group_output(organized.by_status, config)
         else:  # FLAT
             output['pages'] = [
                 self._serialize_page(p, config) for p in organized.all_pages
@@ -427,6 +639,8 @@ class EnhancedFormatter:
             lines.extend(self._markdown_by_depth(organized.by_depth, config))
         elif config.organization == OrganizationType.BY_CONTENT_TYPE:
             lines.extend(self._markdown_by_content_type(organized.by_content_type, config))
+        elif config.organization == OrganizationType.BY_STATUS:
+            lines.extend(self._markdown_by_status(organized.by_status, config))
         else:
             lines.extend(self._markdown_flat(organized.all_pages, config))
 
@@ -450,10 +664,12 @@ class EnhancedFormatter:
         output = io.StringIO()
         writer = csv.writer(output)
 
-        # Header row
+        # Header row with enhanced timing and failure info
         headers = [
-            'URL', 'Title', 'Subdomain', 'Depth', 'Content Type',
-            'Parent URL', 'Links Found', 'Word Count', 'Timing (ms)', 'Error'
+            'URL', 'Title', 'Subdomain', 'Depth', 'Content Type', 'Category',
+            'Parent URL', 'Links Found', 'Word Count',
+            'Total Time (ms)', 'Crawl Time (ms)', 'Scrape Time (ms)',
+            'Failure Phase', 'Failure Type', 'Failure Reason', 'Error'
         ]
         if config.include_content:
             headers.append('Content Preview')
@@ -467,10 +683,16 @@ class EnhancedFormatter:
                 page.metadata.subdomain,
                 page.metadata.depth,
                 page.metadata.content_type.value,
+                page.metadata.category.value,
                 page.metadata.parent_url or '',
                 page.metadata.links_found,
                 page.metadata.word_count,
-                f"{page.metadata.timing_ms:.2f}",
+                f"{page.metadata.timing.total_ms:.2f}",
+                f"{page.metadata.timing.crawl_ms:.2f}",
+                f"{page.metadata.timing.scrape_ms:.2f}",
+                page.metadata.failure.phase,
+                page.metadata.failure.type,
+                page.metadata.failure.reason or '',
                 page.metadata.error or '',
             ]
             if config.include_content:
@@ -488,16 +710,69 @@ class EnhancedFormatter:
             'subdomain': page.metadata.subdomain,
             'depth': page.metadata.depth,
             'content_type': page.metadata.content_type.value,
+            'category': page.metadata.category.value,
             'parent_url': page.metadata.parent_url,
             'links_found': page.metadata.links_found,
             'word_count': page.metadata.word_count,
-            'timing_ms': page.metadata.timing_ms,
+            'timing': {
+                'total_ms': page.metadata.timing.total_ms,
+                'crawl_ms': page.metadata.timing.crawl_ms,
+                'scrape_ms': page.metadata.timing.scrape_ms,
+                'time_before_failure_ms': page.metadata.timing.time_before_failure_ms,
+            },
             'headings': page.headings,
+            'failure': {
+                'phase': page.metadata.failure.phase,
+                'type': page.metadata.failure.type,
+                'reason': page.metadata.failure.reason,
+                'http_status': page.metadata.failure.http_status,
+            } if page.metadata.failure.phase != 'none' else None,
             'error': page.metadata.error,
         }
         if config.include_content and page.content:
             result['content'] = page.content[:config.max_content_length]
         return result
+
+    def _serialize_three_group_output(self, by_status: ThreeGroupOutput, config: OutputConfig) -> dict:
+        """Serialize the three-group output for JSON."""
+        return {
+            'same_domain_success': {
+                'page_count': by_status.same_domain_success.page_count,
+                'total_word_count': by_status.same_domain_success.total_word_count,
+                'avg_timing_ms': by_status.same_domain_success.avg_timing_ms,
+                'avg_crawl_ms': by_status.same_domain_success.avg_crawl_ms,
+                'avg_scrape_ms': by_status.same_domain_success.avg_scrape_ms,
+                'depth_distribution': by_status.same_domain_success.depth_distribution,
+                'content_types': by_status.same_domain_success.content_types,
+                'pages': [self._serialize_page(p, config) for p in by_status.same_domain_success.pages],
+            },
+            'external_domain': {
+                'page_count': by_status.external_domain.page_count,
+                'domains': by_status.external_domain.domains,
+                'subdomain_count': by_status.external_domain.subdomain_count,
+                'external_count': by_status.external_domain.external_count,
+                'depth_distribution': by_status.external_domain.depth_distribution,
+                'status_distribution': by_status.external_domain.status_distribution,
+                'pages': [self._serialize_page(p, config) for p in by_status.external_domain.pages],
+            },
+            'errors': {
+                'page_count': by_status.errors.page_count,
+                'crawl_failures': by_status.errors.crawl_failures,
+                'scrape_failures': by_status.errors.scrape_failures,
+                'total_time_wasted_ms': by_status.errors.total_time_wasted_ms,
+                'failure_types': [
+                    {
+                        'type': ft.type,
+                        'count': ft.count,
+                        'phase': ft.phase,
+                        'example_urls': ft.example_urls,
+                    }
+                    for ft in by_status.errors.failure_types
+                ],
+                'depth_distribution': by_status.errors.depth_distribution,
+                'pages': [self._serialize_page(p, config) for p in by_status.errors.pages],
+            },
+        }
 
     def _serialize_subdomain_group(self, group: SubdomainGroup, config: OutputConfig) -> dict:
         """Serialize a subdomain group for JSON output."""
@@ -599,6 +874,101 @@ class EnhancedFormatter:
 
         return lines
 
+    def _markdown_by_status(
+        self,
+        by_status: ThreeGroupOutput,
+        config: OutputConfig,
+    ) -> list[str]:
+        """Generate markdown content organized by status (three groups)."""
+        lines = []
+
+        # TABLE 1: Same-Domain Successfully Scraped Pages
+        lines.append("## TABLE 1: Same-Domain Successfully Scraped Pages")
+        lines.append("")
+        lines.append(f"**Total Pages:** {by_status.same_domain_success.page_count}")
+        lines.append(f"**Total Words:** {by_status.same_domain_success.total_word_count:,}")
+        lines.append(f"**Avg Total Time:** {by_status.same_domain_success.avg_timing_ms:.2f}ms")
+        lines.append(f"**Avg Crawl Time:** {by_status.same_domain_success.avg_crawl_ms:.2f}ms")
+        lines.append(f"**Avg Scrape Time:** {by_status.same_domain_success.avg_scrape_ms:.2f}ms")
+        lines.append("")
+
+        if by_status.same_domain_success.pages:
+            lines.append("| URL | Depth | Title | Links | Crawl (ms) | Scrape (ms) |")
+            lines.append("|-----|-------|-------|-------|------------|-------------|")
+            for page in by_status.same_domain_success.pages[:100]:
+                title = (page.metadata.title or '-')[:40]
+                lines.append(
+                    f"| {page.metadata.url[:60]}... | {page.metadata.depth} | "
+                    f"{title} | {page.metadata.links_found} | "
+                    f"{page.metadata.timing.crawl_ms:.0f} | {page.metadata.timing.scrape_ms:.0f} |"
+                )
+            if len(by_status.same_domain_success.pages) > 100:
+                lines.append(f"| *... and {len(by_status.same_domain_success.pages) - 100} more* | | | | | |")
+        lines.append("")
+
+        # TABLE 2: External / Different Domain Pages
+        lines.append("## TABLE 2: External / Different Domain Pages")
+        lines.append("")
+        lines.append(f"**Total Pages:** {by_status.external_domain.page_count}")
+        lines.append(f"**Subdomain Pages:** {by_status.external_domain.subdomain_count}")
+        lines.append(f"**External Domain Pages:** {by_status.external_domain.external_count}")
+        lines.append(f"**Domains Found:** {', '.join(by_status.external_domain.domains[:10])}")
+        if len(by_status.external_domain.domains) > 10:
+            lines.append(f"  *... and {len(by_status.external_domain.domains) - 10} more domains*")
+        lines.append("")
+
+        if by_status.external_domain.pages:
+            lines.append("| URL | Parent Source | Domain | Depth | Status |")
+            lines.append("|-----|---------------|--------|-------|--------|")
+            for page in by_status.external_domain.pages[:100]:
+                parent = (page.metadata.parent_url or '-')[:40]
+                status = 'Error' if page.metadata.error else 'Success'
+                lines.append(
+                    f"| {page.metadata.url[:50]}... | {parent} | "
+                    f"{page.metadata.subdomain} | {page.metadata.depth} | {status} |"
+                )
+            if len(by_status.external_domain.pages) > 100:
+                lines.append(f"| *... and {len(by_status.external_domain.pages) - 100} more* | | | | |")
+        lines.append("")
+
+        # TABLE 3: Error / Failed Pages
+        lines.append("## TABLE 3: Error / Failed Pages")
+        lines.append("")
+        lines.append(f"**Total Failed:** {by_status.errors.page_count}")
+        lines.append(f"**Crawl Failures:** {by_status.errors.crawl_failures}")
+        lines.append(f"**Scrape Failures:** {by_status.errors.scrape_failures}")
+        lines.append(f"**Total Time Wasted:** {by_status.errors.total_time_wasted_ms:.2f}ms")
+        lines.append("")
+
+        # Failure type summary
+        if by_status.errors.failure_types:
+            lines.append("### Failure Type Breakdown")
+            lines.append("")
+            lines.append("| Failure Type | Phase | Count | Example URLs |")
+            lines.append("|--------------|-------|-------|--------------|")
+            for ft in by_status.errors.failure_types:
+                examples = ', '.join(ft.example_urls[:2])[:60]
+                lines.append(f"| {ft.type} | {ft.phase} | {ft.count} | {examples}... |")
+            lines.append("")
+
+        if by_status.errors.pages:
+            lines.append("### Failed Pages Detail")
+            lines.append("")
+            lines.append("| URL | Depth | Failure Type | Failure Reason | Time Before Failure (ms) |")
+            lines.append("|-----|-------|--------------|----------------|-------------------------|")
+            for page in by_status.errors.pages[:100]:
+                reason = (page.metadata.failure.reason or page.metadata.error or '-')[:40]
+                time_wasted = page.metadata.timing.time_before_failure_ms or page.metadata.timing.total_ms
+                lines.append(
+                    f"| {page.metadata.url[:50]}... | {page.metadata.depth} | "
+                    f"{page.metadata.failure.type} | {reason} | {time_wasted:.0f} |"
+                )
+            if len(by_status.errors.pages) > 100:
+                lines.append(f"| *... and {len(by_status.errors.pages) - 100} more* | | | | |")
+        lines.append("")
+
+        return lines
+
     def _markdown_flat(
         self,
         pages: list[EnhancedPageResult],
@@ -617,7 +987,7 @@ class EnhancedFormatter:
         page: EnhancedPageResult,
         config: OutputConfig,
     ) -> list[str]:
-        """Generate markdown for a single page."""
+        """Generate markdown for a single page with enhanced timing and failure info."""
         lines = []
         title = page.metadata.title or page.metadata.url
         lines.append(f"#### {title}")
@@ -625,12 +995,29 @@ class EnhancedFormatter:
         lines.append(f"- **URL:** {page.metadata.url}")
         lines.append(f"- **Subdomain:** {page.metadata.subdomain}")
         lines.append(f"- **Depth:** {page.metadata.depth}")
+        lines.append(f"- **Category:** {page.metadata.category.value}")
         lines.append(f"- **Type:** {page.metadata.content_type.value}")
         lines.append(f"- **Words:** {page.metadata.word_count}")
         lines.append(f"- **Links:** {page.metadata.links_found}")
-        lines.append(f"- **Time:** {page.metadata.timing_ms:.2f}ms")
 
-        if page.metadata.error:
+        # Enhanced timing
+        lines.append(f"- **Total Time:** {page.metadata.timing.total_ms:.2f}ms")
+        lines.append(f"- **Crawl Time:** {page.metadata.timing.crawl_ms:.2f}ms")
+        lines.append(f"- **Scrape Time:** {page.metadata.timing.scrape_ms:.2f}ms")
+
+        # Failure info
+        if page.metadata.failure.phase != 'none':
+            lines.append("")
+            lines.append("**Failure Details:**")
+            lines.append(f"- **Phase:** {page.metadata.failure.phase}")
+            lines.append(f"- **Type:** {page.metadata.failure.type}")
+            if page.metadata.failure.reason:
+                lines.append(f"- **Reason:** {page.metadata.failure.reason}")
+            if page.metadata.failure.http_status:
+                lines.append(f"- **HTTP Status:** {page.metadata.failure.http_status}")
+            lines.append(f"- **Time Before Failure:** {page.metadata.timing.time_before_failure_ms:.2f}ms")
+
+        if page.metadata.error and page.metadata.failure.phase == 'none':
             lines.append(f"- **Error:** {page.metadata.error}")
 
         if page.headings:

@@ -38,4 +38,96 @@ export async function deleteJob(jobId: string): Promise<void> {
   await api.delete(`/jobs/${jobId}`);
 }
 
+// Enhanced Export API
+export interface ExportSummary {
+  job_id: string;
+  metadata: {
+    job_id: string;
+    seed_url: string;
+    mode: string;
+    max_depth: number;
+    worker_count: number;
+    allow_subdomains: boolean;
+    allowed_domains: string[];
+    state: string;
+    total_urls_discovered: number;
+    total_pages_scraped: number;
+    total_errors: number;
+  };
+  timing: {
+    total_ms: number;
+    crawling_ms: number;
+    scraping_ms: number;
+    url_discovery_ms: number;
+    avg_page_time_ms: number;
+    fastest_page_ms: number;
+    slowest_page_ms: number;
+  };
+  summary: {
+    total_pages: number;
+    successful_pages: number;
+    failed_pages: number;
+    total_word_count: number;
+    subdomain_count: number;
+    max_depth_reached: number;
+    content_type_distribution: Record<string, number>;
+    subdomain_distribution: Record<string, number>;
+    // Enhanced failure breakdown
+    failure_breakdown?: {
+      crawl_failures: number;
+      scrape_failures: number;
+      total_failures: number;
+    };
+    // Enhanced timing breakdown
+    timing_breakdown?: {
+      avg_crawl_per_page_ms: number;
+      avg_scrape_per_page_ms: number;
+    };
+  };
+  available_organizations: {
+    by_subdomain: Array<{ subdomain: string; page_count: number }>;
+    by_depth: Array<{ depth: number; page_count: number }>;
+    by_content_type: Array<{ content_type: string; page_count: number }>;
+    by_status?: {
+      same_domain_success: number;
+      external_domain: number;
+      errors: number;
+    };
+  };
+  export_formats: string[];
+}
+
+export type OrganizationType = 'flat' | 'by_subdomain' | 'by_depth' | 'by_content_type' | 'by_status';
+export type OutputFormat = 'json' | 'markdown' | 'csv';
+
+export async function getExportSummary(jobId: string): Promise<ExportSummary> {
+  const response = await api.get<ExportSummary>(`/export/${jobId}/summary`);
+  return response.data;
+}
+
+export function getOrganizedExportUrl(
+  jobId: string,
+  organization: OrganizationType = 'flat',
+  format: OutputFormat = 'json',
+  includeContent: boolean = true
+): string {
+  return `${API_BASE}/export/${jobId}/organized?organization=${organization}&format=${format}&include_content=${includeContent}`;
+}
+
+export function getZipExportUrl(jobId: string, includeContent: boolean = true): string {
+  return `${API_BASE}/export/${jobId}/zip?include_content=${includeContent}`;
+}
+
+export function getSubdomainExportUrl(jobId: string, subdomain: string, format: OutputFormat = 'json'): string {
+  return `${API_BASE}/export/${jobId}/by-subdomain/${subdomain}?format=${format}`;
+}
+
+export function getDepthExportUrl(jobId: string, depth: number, format: OutputFormat = 'json'): string {
+  return `${API_BASE}/export/${jobId}/by-depth/${depth}?format=${format}`;
+}
+
+export function getContentTypeExportUrl(jobId: string, contentType: string, format: OutputFormat = 'json'): string {
+  return `${API_BASE}/export/${jobId}/by-content-type/${contentType}?format=${format}`;
+}
+
 export default api;

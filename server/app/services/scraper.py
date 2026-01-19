@@ -13,7 +13,10 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 
-from ..models.crawl import URLTask, PageResult, CrawlMode
+from ..models.crawl import (
+    URLTask, PageResult, CrawlMode, PageTiming, FailureInfo,
+    FailurePhase, FailureType
+)
 from ..utils.logger import get_scraper_logger
 from .timer import PageTimer
 from .rate_limiter import rate_limiter
@@ -127,16 +130,18 @@ class ScraperService:
         Returns:
             Tuple of (PageResult, discovered_urls)
         """
-        timer = PageTimer()
-        timer.start()
+        total_timer = PageTimer()
+        total_timer.start()
 
         logger.debug(f"[FETCH] Starting: {task.url} (depth={task.depth})")
 
         discovered_urls: list[str] = []
+        page_timing = PageTiming()
         result = PageResult(
             url=task.url,
             parent_url=task.parent_url,
             depth=task.depth,
+            page_timing=page_timing,
         )
 
         # Check robots.txt
@@ -145,8 +150,16 @@ class ScraperService:
                 can_fetch = await robots_checker.can_fetch(task.url)
                 if not can_fetch:
                     logger.warning(f"[ROBOTS] Blocked by robots.txt: {task.url}")
+                    elapsed = total_timer.stop()
                     result.error = "Blocked by robots.txt"
-                    result.timing_ms = timer.stop()
+                    result.timing_ms = elapsed
+                    result.page_timing.total_ms = elapsed
+                    result.page_timing.time_before_failure_ms = elapsed
+                    result.failure = FailureInfo(
+                        phase=FailurePhase.CRAWL,
+                        type=FailureType.CRAWL_ROBOTS_BLOCKED,
+                        reason="Blocked by robots.txt",
+                    )
                     return result, discovered_urls
 
                 # Set crawl delay from robots.txt
@@ -163,9 +176,13 @@ class ScraperService:
             logger.debug(f"[RATE_LIMIT] Acquiring for {task.url}")
             await rate_limiter.acquire(task.url)
 
-        # Fetch with retries
+        # Fetch with retries (tracks crawl_ms and scrape_ms internally)
         result, discovered_urls = await self._fetch_with_retry(task, result)
-        result.timing_ms = timer.stop()
+
+        # Finalize total timing
+        total_elapsed = total_timer.stop()
+        result.timing_ms = total_elapsed
+        result.page_timing.total_ms = total_elapsed
 
         return result, discovered_urls
 
@@ -177,6 +194,8 @@ class ScraperService:
         """
         Fetch page with exponential backoff retry.
 
+        Tracks separate timing for crawl (HTTP fetch) and scrape (content extraction).
+
         Args:
             task: URL task to process
             result: PageResult to populate
@@ -187,8 +206,13 @@ class ScraperService:
         discovered_urls: list[str] = []
         delays = [1, 2, 4]  # Exponential backoff delays
         last_error = None
+        last_failure_info = None
+        crawl_time_accumulated = 0.0
 
         for attempt in range(self.max_retries):
+            crawl_timer = PageTimer()
+            crawl_timer.start()
+
             try:
                 session = await self._get_session()
 
@@ -198,13 +222,21 @@ class ScraperService:
                 logger.debug(f"[HTTP] Request attempt {attempt + 1}/{self.max_retries}: {task.url}")
 
                 async with session.get(task.url, headers=headers) as response:
-                    logger.info(f"[HTTP] Response {response.status}: {task.url}")
+                    # Track HTTP fetch time
+                    html = await response.text()
+                    crawl_elapsed = crawl_timer.stop()
+                    crawl_time_accumulated += crawl_elapsed
+
+                    logger.info(f"[HTTP] Response {response.status}: {task.url} ({crawl_elapsed:.2f}ms)")
 
                     if response.status == 200:
-                        html = await response.text()
+                        # Start scrape timing
+                        scrape_timer = PageTimer()
+                        scrape_timer.start()
+
                         soup = BeautifulSoup(html, 'lxml')
 
-                        # Extract links
+                        # Extract links (always done for crawling)
                         discovered_urls = self._extract_links(soup, task.url)
                         result.links_found = len(discovered_urls)
                         logger.debug(f"[LINKS] Found {len(discovered_urls)} links on {task.url}")
@@ -216,12 +248,44 @@ class ScraperService:
                             result.content = self._extract_content(soup)
                             logger.debug(f"[SCRAPE] Extracted content from {task.url} (title: {result.title})")
 
+                            # Check for empty content (potential JS-blocked page)
+                            if not result.content or len(result.content.strip()) < 50:
+                                scrape_elapsed = scrape_timer.stop()
+                                result.page_timing.crawl_ms = crawl_time_accumulated
+                                result.page_timing.scrape_ms = scrape_elapsed
+
+                                # Check if it looks like JS-rendered content
+                                if self._is_js_blocked_page(soup):
+                                    result.failure = FailureInfo(
+                                        phase=FailurePhase.SCRAPE,
+                                        type=FailureType.SCRAPE_JS_BLOCKED,
+                                        reason="Page content appears to require JavaScript rendering",
+                                    )
+                                    result.error = "JS-rendered content blocked"
+                                else:
+                                    result.failure = FailureInfo(
+                                        phase=FailurePhase.SCRAPE,
+                                        type=FailureType.SCRAPE_EMPTY_CONTENT,
+                                        reason="Page returned empty or minimal content",
+                                    )
+                                    result.error = "Empty content"
+
+                        scrape_elapsed = scrape_timer.stop()
+                        result.page_timing.crawl_ms = crawl_time_accumulated
+                        result.page_timing.scrape_ms = scrape_elapsed
+
                         return result, discovered_urls
 
                     elif response.status == 429:
                         # Rate limited - wait longer
                         logger.warning(f"[HTTP] Rate limited (429): {task.url}, waiting {delays[attempt] * 2}s")
-                        result.error = f"Rate limited (429)"
+                        last_error = "Rate limited (429)"
+                        last_failure_info = FailureInfo(
+                            phase=FailurePhase.CRAWL,
+                            type=FailureType.CRAWL_HTTP_4XX,
+                            reason="Rate limited by server",
+                            http_status=429,
+                        )
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(delays[attempt] * 2)
                             continue
@@ -230,36 +294,150 @@ class ScraperService:
                         # Server error - retry
                         logger.warning(f"[HTTP] Server error {response.status}: {task.url}, retrying...")
                         last_error = f"HTTP {response.status}"
+                        last_failure_info = FailureInfo(
+                            phase=FailurePhase.CRAWL,
+                            type=FailureType.CRAWL_HTTP_5XX,
+                            reason=f"Server error: HTTP {response.status}",
+                            http_status=response.status,
+                        )
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(delays[attempt])
                             continue
 
                     else:
-                        # Client error - don't retry
+                        # Client error (4xx) - don't retry
                         logger.error(f"[HTTP] Client error {response.status}: {task.url}")
                         result.error = f"HTTP {response.status}"
+                        result.page_timing.crawl_ms = crawl_time_accumulated
+                        result.page_timing.time_before_failure_ms = crawl_time_accumulated
+                        result.failure = FailureInfo(
+                            phase=FailurePhase.CRAWL,
+                            type=FailureType.CRAWL_HTTP_4XX,
+                            reason=f"Client error: HTTP {response.status}",
+                            http_status=response.status,
+                        )
                         return result, discovered_urls
 
             except asyncio.TimeoutError:
+                crawl_elapsed = crawl_timer.stop()
+                crawl_time_accumulated += crawl_elapsed
                 logger.warning(f"[HTTP] Timeout on attempt {attempt + 1}: {task.url}")
                 last_error = "Request timeout"
+                last_failure_info = FailureInfo(
+                    phase=FailurePhase.CRAWL,
+                    type=FailureType.CRAWL_TIMEOUT,
+                    reason="Connection timed out",
+                )
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(delays[attempt])
+
+            except aiohttp.ClientConnectorError as e:
+                crawl_elapsed = crawl_timer.stop()
+                crawl_time_accumulated += crawl_elapsed
+                error_str = str(e).lower()
+                logger.warning(f"[HTTP] Connection error on attempt {attempt + 1}: {task.url} - {e}")
+
+                # Classify the connection error
+                if "ssl" in error_str or "certificate" in error_str:
+                    last_error = f"SSL error: {str(e)}"
+                    last_failure_info = FailureInfo(
+                        phase=FailurePhase.CRAWL,
+                        type=FailureType.CRAWL_SSL_ERROR,
+                        reason="SSL/TLS certificate error",
+                        exception=str(e),
+                    )
+                elif "dns" in error_str or "getaddrinfo" in error_str or "name resolution" in error_str:
+                    last_error = f"DNS error: {str(e)}"
+                    last_failure_info = FailureInfo(
+                        phase=FailurePhase.CRAWL,
+                        type=FailureType.CRAWL_DNS_ERROR,
+                        reason="DNS resolution failed",
+                        exception=str(e),
+                    )
+                else:
+                    last_error = f"Connection error: {str(e)}"
+                    last_failure_info = FailureInfo(
+                        phase=FailurePhase.CRAWL,
+                        type=FailureType.CRAWL_CONNECTION_ERROR,
+                        reason="Connection failed",
+                        exception=str(e),
+                    )
+
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(delays[attempt])
 
             except aiohttp.ClientError as e:
+                crawl_elapsed = crawl_timer.stop()
+                crawl_time_accumulated += crawl_elapsed
                 logger.warning(f"[HTTP] Client error on attempt {attempt + 1}: {task.url} - {e}")
                 last_error = f"Client error: {str(e)}"
+                last_failure_info = FailureInfo(
+                    phase=FailurePhase.CRAWL,
+                    type=FailureType.CRAWL_CONNECTION_ERROR,
+                    reason="HTTP client error",
+                    exception=str(e),
+                )
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(delays[attempt])
 
             except Exception as e:
+                crawl_elapsed = crawl_timer.stop()
+                crawl_time_accumulated += crawl_elapsed
                 logger.error(f"[HTTP] Unexpected error: {task.url} - {e}")
                 last_error = f"Unexpected error: {str(e)}"
+                last_failure_info = FailureInfo(
+                    phase=FailurePhase.CRAWL,
+                    type=FailureType.UNKNOWN,
+                    reason="Unexpected error during crawl",
+                    exception=str(e),
+                )
                 break  # Don't retry on unexpected errors
 
+        # All retries exhausted
         logger.error(f"[HTTP] All retries failed for {task.url}: {last_error}")
         result.error = last_error
+        result.page_timing.crawl_ms = crawl_time_accumulated
+        result.page_timing.time_before_failure_ms = crawl_time_accumulated
+        if last_failure_info:
+            result.failure = last_failure_info
+
         return result, discovered_urls
+
+    def _is_js_blocked_page(self, soup: BeautifulSoup) -> bool:
+        """
+        Check if the page appears to require JavaScript rendering.
+
+        Args:
+            soup: Parsed HTML
+
+        Returns:
+            True if page appears to be JS-rendered
+        """
+        # Check for common JS framework indicators
+        body = soup.find('body')
+        if not body:
+            return True
+
+        # Check for React/Vue/Angular root elements with no content
+        js_indicators = [
+            ('div', {'id': 'root'}),
+            ('div', {'id': 'app'}),
+            ('div', {'id': '__next'}),
+            ('div', {'class': 'app'}),
+        ]
+
+        for tag, attrs in js_indicators:
+            element = soup.find(tag, attrs)
+            if element and len(element.get_text(strip=True)) < 50:
+                return True
+
+        # Check for noscript warning
+        noscript = soup.find('noscript')
+        if noscript and ('javascript' in noscript.get_text().lower() or
+                         'enable' in noscript.get_text().lower()):
+            return True
+
+        return False
 
     def _extract_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
         """Extract all links from the page."""

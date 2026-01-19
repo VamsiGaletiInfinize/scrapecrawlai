@@ -188,6 +188,7 @@ class JobManager:
             worker_count=request.worker_count,
             allow_subdomains=request.allow_subdomains,
             allowed_domains=request.allowed_domains,
+            include_child_pages=request.include_child_pages,
         )
 
         # Create domain filter for this job
@@ -305,6 +306,7 @@ class JobManager:
                 mode=status.mode,
                 base_domain=base_domain,
                 normalize_url_func=normalize_url,
+                include_child_pages=status.include_child_pages,
             )
 
             # Stop total timer
@@ -334,6 +336,7 @@ class JobManager:
                 worker_count=status.worker_count,
                 allow_subdomains=status.allow_subdomains,
                 allowed_domains=status.allowed_domains,
+                include_child_pages=status.include_child_pages,
                 state=CrawlState.COMPLETED,
                 timing=status.timing,
                 urls_by_depth=depth_stats,

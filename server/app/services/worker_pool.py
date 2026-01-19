@@ -3,7 +3,7 @@ import time
 from typing import Callable, Awaitable
 from collections import deque
 
-from ..models.crawl import URLTask, PageResult, CrawlMode, TimingMetrics, DepthStats
+from ..models.crawl import URLTask, PageResult, CrawlMode, TimingMetrics, DepthStats, PageStatus, SkipReason
 
 
 class WorkerPool:
@@ -49,11 +49,16 @@ class WorkerPool:
         self._crawl_time_accumulated = 0.0
         self._scrape_time_accumulated = 0.0
 
+        # Failure tracking
+        self._crawl_failures = 0
+        self._scrape_failures = 0
+
     async def _process_url(
         self,
         task: URLTask,
         results_list: list[tuple[PageResult, list[str]]],
         on_url_complete: Callable[[], Awaitable[None]] | None = None,
+        skip_scraping: bool = False,
     ) -> None:
         """
         Process a single URL with semaphore-controlled concurrency.
@@ -62,11 +67,30 @@ class WorkerPool:
             task: URL task to process
             results_list: Shared list to append results
             on_url_complete: Optional callback when URL processing completes
+            skip_scraping: If True, only discover URLs without extracting content
         """
         async with self.semaphore:
             start_time = time.perf_counter()
             try:
                 result, discovered_urls = await self.process_callback(task)
+
+                # If skipping scraping for child pages, clear content and mark as skipped
+                if skip_scraping:
+                    result.content = None
+                    result.title = None
+                    result.headings = []
+                    result.status = PageStatus.SKIPPED
+                    result.skip_reason = SkipReason.CHILD_PAGES_DISABLED
+                    # Clear any scrape timing since we're not counting it
+                    result.page_timing.scrape_ms = 0.0
+                else:
+                    # Set appropriate status based on content
+                    if result.content:
+                        result.status = PageStatus.SCRAPED
+                    elif result.error:
+                        result.status = PageStatus.ERROR
+                    else:
+                        result.status = PageStatus.CRAWLED
 
                 # Store result
                 async with self.lock:
@@ -83,7 +107,8 @@ class WorkerPool:
                     parent_url=task.parent_url,
                     depth=task.depth,
                     error=str(e),
-                    timing_ms=(time.perf_counter() - start_time) * 1000
+                    timing_ms=(time.perf_counter() - start_time) * 1000,
+                    status=PageStatus.ERROR,
                 )
                 async with self.lock:
                     results_list.append((result, []))
@@ -96,6 +121,7 @@ class WorkerPool:
         self,
         tasks: list[URLTask],
         on_url_complete: Callable[[], Awaitable[None]] | None = None,
+        skip_scraping_for_depth: int | None = None,
     ) -> list[tuple[PageResult, list[str]]]:
         """
         Process a batch of URLs concurrently using the worker pool.
@@ -103,6 +129,7 @@ class WorkerPool:
         Args:
             tasks: List of URL tasks to process
             on_url_complete: Optional callback when each URL completes
+            skip_scraping_for_depth: If set, skip scraping for pages at this depth or deeper
 
         Returns:
             List of (PageResult, discovered_urls) tuples
@@ -111,7 +138,14 @@ class WorkerPool:
 
         # Create tasks for all URLs
         async_tasks = [
-            asyncio.create_task(self._process_url(task, results_list, on_url_complete))
+            asyncio.create_task(
+                self._process_url(
+                    task,
+                    results_list,
+                    on_url_complete,
+                    skip_scraping=(skip_scraping_for_depth is not None and task.depth >= skip_scraping_for_depth),
+                )
+            )
             for task in tasks
         ]
 
@@ -128,6 +162,7 @@ class WorkerPool:
         mode: CrawlMode,
         base_domain: str,
         normalize_url_func: Callable[[str, str], str | None],
+        include_child_pages: bool = True,
     ) -> tuple[list[PageResult], TimingMetrics, list[DepthStats]]:
         """
         Execute BFS crawl using worker pool.
@@ -138,10 +173,12 @@ class WorkerPool:
             mode: Crawl execution mode
             base_domain: Base domain for same-domain filtering
             normalize_url_func: Function to normalize URLs
+            include_child_pages: Whether to scrape child pages (depth > 1)
 
         Returns:
             Tuple of (results, timing_metrics, depth_stats)
         """
+        self._include_child_pages = include_child_pages
         total_start = time.perf_counter()
 
         # Initialize queue with seed
@@ -198,16 +235,33 @@ class WorkerPool:
                     })
 
             # Process current level with worker pool
-            crawl_start = time.perf_counter()
-            batch_results = await self.process_batch(current_level_tasks, on_url_complete)
-            crawl_time = (time.perf_counter() - crawl_start) * 1000
+            # Skip scraping for child pages (depth >= 2) if include_child_pages is False
+            skip_depth = 2 if not include_child_pages else None
+            batch_start = time.perf_counter()
+            batch_results = await self.process_batch(
+                current_level_tasks,
+                on_url_complete,
+                skip_scraping_for_depth=skip_depth,
+            )
+            batch_time = (time.perf_counter() - batch_start) * 1000
 
-            # Track timing
-            self.timing.crawling_ms += crawl_time
+            # Track timing from individual page results (more accurate)
+            batch_crawl_ms = 0.0
+            batch_scrape_ms = 0.0
 
             # Process results and discover new URLs
             discovery_start = time.perf_counter()
             for result, discovered_urls in batch_results:
+                # Aggregate timing from page results
+                batch_crawl_ms += result.page_timing.crawl_ms
+                batch_scrape_ms += result.page_timing.scrape_ms
+
+                # Track failures by phase (skipped pages are NOT failures)
+                if result.status != PageStatus.SKIPPED:
+                    if result.failure.phase.value == "crawl":
+                        self._crawl_failures += 1
+                    elif result.failure.phase.value == "scrape":
+                        self._scrape_failures += 1
                 self.results.append(result)
 
                 # Add discovered URLs to queue if within depth limit
@@ -245,7 +299,14 @@ class WorkerPool:
                                 self.urls_by_depth[next_depth] = []
                             self.urls_by_depth[next_depth].append(normalized)
 
-            self.timing.url_discovery_ms += (time.perf_counter() - discovery_start) * 1000
+            discovery_time = (time.perf_counter() - discovery_start) * 1000
+            self.timing.url_discovery_ms += discovery_time
+
+            # Update accumulated timing (crawl/scrape from page results)
+            self.timing.crawling_ms += batch_crawl_ms
+            self.timing.scraping_ms += batch_scrape_ms
+            self._crawl_time_accumulated += batch_crawl_ms
+            self._scrape_time_accumulated += batch_scrape_ms
 
             # Update total to process with newly discovered URLs
             self._total_to_process = len(self.results) + len(queue)
@@ -280,4 +341,35 @@ class WorkerPool:
             "num_workers": self.num_workers,
             "urls_processed": len(self.results),
             "urls_visited": len(self.visited),
+            "crawl_failures": self._crawl_failures,
+            "scrape_failures": self._scrape_failures,
+            "total_crawl_time_ms": self._crawl_time_accumulated,
+            "total_scrape_time_ms": self._scrape_time_accumulated,
+        }
+
+    def get_timing_breakdown(self) -> dict:
+        """Get detailed timing breakdown."""
+        return {
+            "url_discovery_ms": round(self.timing.url_discovery_ms, 2),
+            "crawling_ms": round(self.timing.crawling_ms, 2),
+            "scraping_ms": round(self.timing.scraping_ms, 2),
+            "total_ms": round(self.timing.total_ms, 2),
+            "avg_crawl_per_page_ms": round(
+                self._crawl_time_accumulated / len(self.results) if self.results else 0, 2
+            ),
+            "avg_scrape_per_page_ms": round(
+                self._scrape_time_accumulated / len(self.results) if self.results else 0, 2
+            ),
+        }
+
+    def get_failure_stats(self) -> dict:
+        """Get failure statistics."""
+        total_failed = self._crawl_failures + self._scrape_failures
+        return {
+            "total_failures": total_failed,
+            "crawl_failures": self._crawl_failures,
+            "scrape_failures": self._scrape_failures,
+            "success_rate": round(
+                (len(self.results) - total_failed) / len(self.results) * 100 if self.results else 0, 2
+            ),
         }

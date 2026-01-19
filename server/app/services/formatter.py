@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from ..models.crawl import CrawlResult, PageResult, TimingMetrics, DepthStats, CrawlMode
+from ..models.crawl import CrawlResult, PageResult, TimingMetrics, DepthStats, CrawlMode, PageStatus
 
 
 class OutputFormatter:
@@ -61,7 +61,21 @@ class OutputFormatter:
                     "content": page.content,
                     "links_found": page.links_found,
                     "timing_ms": page.timing_ms,
+                    "timing": {
+                        "total_ms": page.page_timing.total_ms,
+                        "crawl_ms": page.page_timing.crawl_ms,
+                        "scrape_ms": page.page_timing.scrape_ms,
+                        "time_before_failure_ms": page.page_timing.time_before_failure_ms,
+                    },
+                    "status": page.status.value,
+                    "skip_reason": page.skip_reason.value if page.status == PageStatus.SKIPPED else None,
                     "error": page.error,
+                    "failure": {
+                        "phase": page.failure.phase.value,
+                        "type": page.failure.type.value,
+                        "reason": page.failure.reason,
+                        "http_status": page.failure.http_status,
+                    } if page.failure.phase.value != "none" else None,
                 }
                 for page in result.pages
             ],
@@ -117,10 +131,8 @@ class OutputFormatter:
         for ds in result.urls_by_depth:
             lines.append(f"### Depth {ds.depth} ({ds.urls_count} URLs)")
             lines.append("")
-            for url in ds.urls[:50]:  # Limit to 50 per depth
+            for url in ds.urls:  # Show all URLs for sitemap comparison
                 lines.append(f"- {url}")
-            if len(ds.urls) > 50:
-                lines.append(f"- ... and {len(ds.urls) - 50} more")
             lines.append("")
 
         # Pages Content
@@ -134,11 +146,26 @@ class OutputFormatter:
             if page.parent_url:
                 lines.append(f"**Parent:** {page.parent_url}")
             lines.append(f"**Depth:** {page.depth}")
+            lines.append(f"**Status:** {page.status.value}")
+            if page.status == PageStatus.SKIPPED:
+                lines.append(f"**Skip Reason:** {page.skip_reason.value}")
             lines.append(f"**Links Found:** {page.links_found}")
             lines.append(f"**Processing Time:** {page.timing_ms:.2f}ms")
+            lines.append(f"**Crawl Time:** {page.page_timing.crawl_ms:.2f}ms")
+            lines.append(f"**Scrape Time:** {page.page_timing.scrape_ms:.2f}ms")
 
             if page.error:
                 lines.append(f"**Error:** {page.error}")
+
+            if page.failure.phase.value != "none":
+                lines.append("")
+                lines.append("**Failure Details:**")
+                lines.append(f"- Phase: {page.failure.phase.value}")
+                lines.append(f"- Type: {page.failure.type.value}")
+                if page.failure.reason:
+                    lines.append(f"- Reason: {page.failure.reason}")
+                if page.failure.http_status:
+                    lines.append(f"- HTTP Status: {page.failure.http_status}")
 
             if page.headings:
                 lines.append("")
@@ -154,8 +181,8 @@ class OutputFormatter:
                 lines.append("")
                 lines.append("```")
                 # Limit content preview
-                preview = page.content[:2000]
-                if len(page.content) > 2000:
+                preview = page.content[:4000]
+                if len(page.content) > 4000:
                     preview += "\n...[truncated]"
                 lines.append(preview)
                 lines.append("```")
@@ -207,15 +234,31 @@ class OutputFormatter:
         Returns:
             Summary dictionary
         """
-        successful_pages = [p for p in pages if not p.error]
-        failed_pages = [p for p in pages if p.error]
-        scraped_pages = [p for p in pages if p.content]
+        # Categorize pages by status
+        scraped_pages = [p for p in pages if p.status == PageStatus.SCRAPED]
+        crawled_pages = [p for p in pages if p.status == PageStatus.CRAWLED]
+        skipped_pages = [p for p in pages if p.status == PageStatus.SKIPPED]
+        error_pages = [p for p in pages if p.status == PageStatus.ERROR]
+
+        # Legacy: successful = non-error pages (including skipped)
+        successful_pages = [p for p in pages if p.status != PageStatus.ERROR]
+        failed_pages = error_pages
+
+        # Count failures by phase (skipped pages are NOT failures)
+        crawl_failures = sum(1 for p in pages if p.status == PageStatus.ERROR and p.failure.phase.value == "crawl")
+        scrape_failures = sum(1 for p in pages if p.status == PageStatus.ERROR and p.failure.phase.value == "scrape")
+
+        # Calculate timing breakdowns
+        total_crawl_ms = sum(p.page_timing.crawl_ms for p in pages)
+        total_scrape_ms = sum(p.page_timing.scrape_ms for p in pages)
 
         return {
             "total_pages": len(pages),
             "successful_pages": len(successful_pages),
             "failed_pages": len(failed_pages),
             "scraped_pages": len(scraped_pages),
+            "skipped_pages": len(skipped_pages),
+            "crawled_pages": len(crawled_pages),
             "total_links_found": sum(p.links_found for p in pages),
             "depth_distribution": {
                 ds.depth: ds.urls_count for ds in depth_stats
@@ -225,4 +268,19 @@ class OutputFormatter:
                 2
             ),
             "mode": mode.value,
+            # Enhanced timing breakdown
+            "timing_breakdown": {
+                "url_discovery_ms": round(timing.url_discovery_ms, 2),
+                "crawling_ms": round(timing.crawling_ms, 2),
+                "scraping_ms": round(timing.scraping_ms, 2),
+                "total_ms": round(timing.total_ms, 2),
+                "avg_crawl_per_page_ms": round(total_crawl_ms / len(pages), 2) if pages else 0,
+                "avg_scrape_per_page_ms": round(total_scrape_ms / len(pages), 2) if pages else 0,
+            },
+            # Enhanced failure breakdown
+            "failure_breakdown": {
+                "crawl_failures": crawl_failures,
+                "scrape_failures": scrape_failures,
+                "total_failures": crawl_failures + scrape_failures,
+            },
         }

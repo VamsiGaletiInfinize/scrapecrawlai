@@ -31,6 +31,7 @@ export function CrawlForm({ onSubmit, isLoading }: CrawlFormProps) {
   const [workerCount, setWorkerCount] = useState(4);
   const [allowSubdomains, setAllowSubdomains] = useState(false);
   const [allowedDomainsInput, setAllowedDomainsInput] = useState('');
+  const [includeChildPages, setIncludeChildPages] = useState(true);
   const [error, setError] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -58,6 +59,7 @@ export function CrawlForm({ onSubmit, isLoading }: CrawlFormProps) {
       worker_count: workerCount,
       allow_subdomains: allowSubdomains,
       allowed_domains: allowedDomains,
+      include_child_pages: includeChildPages,
     });
   };
 
@@ -150,6 +152,23 @@ export function CrawlForm({ onSubmit, isLoading }: CrawlFormProps) {
         </label>
         <span className="checkbox-description">
           Crawl all subdomains of the seed URL's domain (e.g., blog.example.com, docs.example.com)
+        </span>
+      </div>
+
+      <div className="form-group">
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={includeChildPages}
+            onChange={(e) => setIncludeChildPages(e.target.checked)}
+            disabled={isLoading || mode === 'only_scrape'}
+          />
+          <span>Include All Child Pages</span>
+        </label>
+        <span className="checkbox-description">
+          {includeChildPages
+            ? 'All discovered child pages will be fully crawled and scraped'
+            : 'Child pages will be discovered but not scraped (only root page gets full content extraction)'}
         </span>
       </div>
 
