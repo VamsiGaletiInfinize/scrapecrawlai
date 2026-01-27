@@ -4,6 +4,12 @@ import type {
   CrawlStatus,
   CrawlResults,
   StartCrawlResponse,
+  MultiKBCrawlRequest,
+  MultiKBCrawlStatus,
+  MultiKBCrawlResult,
+  MultiKBStartResponse,
+  MultiKBValidationResult,
+  KBCrawlResult,
 } from '../types';
 
 const API_BASE = '/api';
@@ -128,6 +134,116 @@ export function getDepthExportUrl(jobId: string, depth: number, format: OutputFo
 
 export function getContentTypeExportUrl(jobId: string, contentType: string, format: OutputFormat = 'json'): string {
   return `${API_BASE}/export/${jobId}/by-content-type/${contentType}?format=${format}`;
+}
+
+// ============================================================================
+// Knowledge Base API
+// ============================================================================
+
+const KB_API_BASE = '/kb';
+
+export async function startMultiKBCrawl(request: MultiKBCrawlRequest): Promise<MultiKBStartResponse> {
+  const response = await api.post<MultiKBStartResponse>(`${KB_API_BASE}/start-crawl`, request);
+  return response.data;
+}
+
+export async function getMultiKBStatus(jobId: string): Promise<MultiKBCrawlStatus> {
+  const response = await api.get<MultiKBCrawlStatus>(`${KB_API_BASE}/status/${jobId}`);
+  return response.data;
+}
+
+export async function getMultiKBResults(jobId: string): Promise<MultiKBCrawlResult> {
+  const response = await api.get<MultiKBCrawlResult>(`${KB_API_BASE}/results/${jobId}`);
+  return response.data;
+}
+
+export async function getMultiKBResultsSummary(jobId: string): Promise<{
+  job_id: string;
+  domain: string;
+  mode: string;
+  state: string;
+  summary: MultiKBCrawlResult['summary'];
+  knowledge_bases: Array<{
+    kb_id: string;
+    kb_name: string;
+    state: string;
+    urls_discovered: number;
+    urls_processed: number;
+    pages_scraped: number;
+    pages_failed: number;
+    duration_ms: number;
+    error: string | null;
+  }>;
+}> {
+  const response = await api.get(`${KB_API_BASE}/results/${jobId}/summary`);
+  return response.data;
+}
+
+export async function getKBResults(jobId: string, kbId: string): Promise<KBCrawlResult> {
+  const response = await api.get<KBCrawlResult>(`${KB_API_BASE}/results/${jobId}/kb/${kbId}`);
+  return response.data;
+}
+
+export async function getKBPages(
+  jobId: string,
+  kbId: string,
+  options: {
+    includeContent?: boolean;
+    depth?: number;
+    statusFilter?: string;
+    limit?: number;
+    offset?: number;
+  } = {}
+): Promise<{
+  kb_id: string;
+  kb_name: string;
+  total_pages: number;
+  offset: number;
+  limit: number;
+  pages: Array<{
+    url: string;
+    parent_url: string | null;
+    depth: number;
+    title: string | null;
+    status: string;
+    links_found: number;
+    matched_prefix: string;
+    timing_ms: number;
+    error: string | null;
+    content: string | null;
+  }>;
+}> {
+  const params = new URLSearchParams();
+  if (options.includeContent !== undefined) params.append('include_content', String(options.includeContent));
+  if (options.depth !== undefined) params.append('depth', String(options.depth));
+  if (options.statusFilter) params.append('status_filter', options.statusFilter);
+  if (options.limit !== undefined) params.append('limit', String(options.limit));
+  if (options.offset !== undefined) params.append('offset', String(options.offset));
+
+  const response = await api.get(`${KB_API_BASE}/results/${jobId}/kb/${kbId}/pages?${params.toString()}`);
+  return response.data;
+}
+
+export async function validateMultiKBConfig(request: MultiKBCrawlRequest): Promise<MultiKBValidationResult> {
+  const response = await api.post<MultiKBValidationResult>(`${KB_API_BASE}/validate`, request);
+  return response.data;
+}
+
+export async function deleteMultiKBJob(jobId: string): Promise<void> {
+  await api.delete(`${KB_API_BASE}/jobs/${jobId}`);
+}
+
+export async function cancelMultiKBJob(jobId: string): Promise<{ message: string }> {
+  const response = await api.post(`${KB_API_BASE}/jobs/${jobId}/cancel`);
+  return response.data;
+}
+
+export function getMultiKBDownloadUrl(jobId: string, format: 'json' | 'markdown'): string {
+  return `${API_BASE}${KB_API_BASE}/download/${jobId}/${format}`;
+}
+
+export function getKBDownloadUrl(jobId: string, kbId: string, format: 'json'): string {
+  return `${API_BASE}${KB_API_BASE}/download/${jobId}/kb/${kbId}/${format}`;
 }
 
 export default api;

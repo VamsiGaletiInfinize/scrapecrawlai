@@ -208,3 +208,168 @@ export interface ThreeGroupOutput {
   external_domain: ExternalDomainGroup;
   errors: ErrorGroup;
 }
+
+// ============================================================================
+// Knowledge Base Types
+// ============================================================================
+
+export type KBCrawlState = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+export interface KnowledgeBaseConfig {
+  kb_id: string;
+  name: string;
+  description?: string;
+  entry_urls: string[];
+  is_active: boolean;
+  max_depth?: number;
+}
+
+export interface KnowledgeBaseCrawlStatus {
+  kb_id: string;
+  kb_name: string;
+  state: KBCrawlState;
+  entry_urls: string[];
+  allowed_prefixes: string[];
+  urls_discovered: number;
+  urls_processed: number;
+  urls_queued: number;
+  urls_skipped_out_of_scope: number;
+  current_depth: number;
+  max_depth: number;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number;
+  error: string | null;
+  pages_scraped: number;
+  pages_crawled: number;
+  pages_failed: number;
+}
+
+export interface KBPageResult extends PageResult {
+  kb_id: string;
+  kb_name: string;
+  matched_prefix: string;
+}
+
+export interface KBDepthStats {
+  depth: number;
+  urls_count: number;
+  urls: string[];
+}
+
+export interface KBCrawlResult {
+  kb_id: string;
+  kb_name: string;
+  entry_urls: string[];
+  allowed_prefixes: string[];
+  state: KBCrawlState;
+  pages: KBPageResult[];
+  urls_by_depth: KBDepthStats[];
+  urls_discovered: number;
+  urls_processed: number;
+  urls_out_of_scope: number;
+  pages_scraped: number;
+  pages_crawled: number;
+  pages_failed: number;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number;
+  error: string | null;
+}
+
+export interface MultiKBCrawlRequest {
+  domain: string;
+  knowledge_bases: KnowledgeBaseConfig[];
+  mode: CrawlMode;
+  max_depth: number;
+  worker_count: number;
+  respect_robots_txt?: boolean;
+  allow_subdomains?: boolean;
+  include_child_pages?: boolean;
+  parallel_kbs?: number;
+  auto_discover_prefixes?: boolean;
+}
+
+export interface MultiKBSummary {
+  total_kbs: number;
+  kbs_completed: number;
+  kbs_failed: number;
+  kbs_skipped: number;
+  total_pages: number;
+  total_pages_scraped: number;
+  total_pages_failed: number;
+  total_urls_discovered: number;
+  total_urls_out_of_scope: number;
+  total_duration_ms: number;
+  pages_by_kb: Record<string, number>;
+}
+
+export interface MultiKBCrawlStatus {
+  job_id: string;
+  domain: string;
+  state: CrawlState;
+  mode: CrawlMode;
+  total_kbs: number;
+  kbs_completed: number;
+  kbs_failed: number;
+  kbs_running: number;
+  kbs_pending: number;
+  knowledge_bases: KnowledgeBaseCrawlStatus[];
+  total_urls_discovered: number;
+  total_urls_processed: number;
+  total_urls_out_of_scope: number;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+}
+
+export interface MultiKBCrawlResult {
+  job_id: string;
+  domain: string;
+  mode: CrawlMode;
+  state: CrawlState;
+  max_depth: number;
+  worker_count: number;
+  allow_subdomains: boolean;
+  include_child_pages: boolean;
+  auto_discover_prefixes: boolean;
+  knowledge_bases: KBCrawlResult[];
+  summary: MultiKBSummary;
+  started_at: string | null;
+  completed_at: string | null;
+  total_duration_ms: number;
+  error: string | null;
+}
+
+export interface MultiKBStartResponse {
+  job_id: string;
+  message: string;
+  domain: string;
+  mode: CrawlMode;
+  max_depth: number;
+  worker_count: number;
+  parallel_kbs: number;
+  knowledge_bases: Array<{
+    kb_id: string;
+    name: string;
+    entry_urls: string[];
+    allowed_prefixes: string[];
+  }>;
+  warnings?: {
+    overlapping_scopes: string[];
+    message: string;
+  };
+}
+
+export interface MultiKBValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+  knowledge_bases: Array<{
+    kb_id: string;
+    name: string;
+    entry_urls: string[];
+    allowed_prefixes: string[];
+    is_active: boolean;
+  }>;
+}
