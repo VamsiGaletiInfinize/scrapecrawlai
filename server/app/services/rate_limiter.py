@@ -8,7 +8,10 @@ to each domain, respecting robots.txt crawl-delay directives.
 import asyncio
 import time
 from collections import defaultdict
+from typing import Optional
 from urllib.parse import urlparse
+
+from ..config import config
 
 
 class DomainRateLimiter:
@@ -21,14 +24,14 @@ class DomainRateLimiter:
     - Async-safe with per-domain locks
     """
 
-    def __init__(self, default_delay: float = 0.25):
+    def __init__(self, default_delay: Optional[float] = None):
         """
         Initialize the rate limiter.
 
         Args:
-            default_delay: Default delay between requests in seconds
+            default_delay: Default delay between requests in seconds (uses config if not provided)
         """
-        self.default_delay = default_delay
+        self.default_delay = default_delay or config.rate_limit.DEFAULT_DELAY
         self._last_request: dict[str, float] = defaultdict(float)
         self._locks: dict[str, asyncio.Lock] = {}
         self._custom_delays: dict[str, float] = {}
@@ -106,13 +109,13 @@ class AdaptiveRateLimiter(DomainRateLimiter):
 
     def __init__(
         self,
-        default_delay: float = 0.25,
-        min_delay: float = 0.1,
-        max_delay: float = 5.0,
+        default_delay: Optional[float] = None,
+        min_delay: Optional[float] = None,
+        max_delay: Optional[float] = None,
     ):
         super().__init__(default_delay)
-        self.min_delay = min_delay
-        self.max_delay = max_delay
+        self.min_delay = min_delay or config.rate_limit.MIN_DELAY
+        self.max_delay = max_delay or config.rate_limit.MAX_DELAY
         self._response_times: dict[str, list[float]] = defaultdict(list)
 
     def record_response(self, url: str, response_time: float, success: bool) -> None:

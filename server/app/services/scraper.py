@@ -4,15 +4,14 @@ retry logic, and rate limiting integration.
 """
 
 import asyncio
-import random
 import re
-import time
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
 
+from ..config import config, get_random_user_agent
 from ..models.crawl import (
     URLTask, PageResult, CrawlMode, PageTiming, FailureInfo,
     FailurePhase, FailureType
@@ -24,21 +23,6 @@ from .robots import robots_checker
 
 # Initialize logger
 logger = get_scraper_logger()
-
-# User agent pool for rotation
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-]
-
-
-def get_random_user_agent() -> str:
-    """Get a random user agent from the pool."""
-    return random.choice(USER_AGENTS)
 
 
 class ScraperService:
@@ -55,8 +39,8 @@ class ScraperService:
     def __init__(
         self,
         mode: CrawlMode,
-        timeout: int = 30,
-        max_retries: int = 3,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
         respect_robots: bool = True,
         use_rate_limiting: bool = True,
     ):
@@ -65,14 +49,17 @@ class ScraperService:
 
         Args:
             mode: Crawl execution mode
-            timeout: Request timeout in seconds
-            max_retries: Maximum retry attempts for failed requests
+            timeout: Request timeout in seconds (uses config default if not provided)
+            max_retries: Maximum retry attempts for failed requests (uses config default)
             respect_robots: Whether to check robots.txt
             use_rate_limiting: Whether to use rate limiting
         """
         self.mode = mode
-        self.timeout = aiohttp.ClientTimeout(total=timeout, connect=10)
-        self.max_retries = max_retries
+        self.timeout = aiohttp.ClientTimeout(
+            total=timeout or config.http.REQUEST_TIMEOUT,
+            connect=config.http.CONNECT_TIMEOUT,
+        )
+        self.max_retries = max_retries or config.http.MAX_RETRIES
         self.respect_robots = respect_robots
         self.use_rate_limiting = use_rate_limiting
         self._session: Optional[aiohttp.ClientSession] = None
@@ -88,12 +75,12 @@ class ScraperService:
         - Keep-alive connections
         """
         if self._session is None or self._session.closed:
-            # Create connector with connection pooling
+            # Create connector with connection pooling from config
             self._connector = aiohttp.TCPConnector(
-                limit=100,              # Total connection pool size
-                limit_per_host=10,      # Connections per domain
-                ttl_dns_cache=300,      # DNS cache TTL (5 minutes)
-                keepalive_timeout=30,   # Keep connections alive
+                limit=config.http.CONNECTION_POOL_SIZE,
+                limit_per_host=config.http.CONNECTIONS_PER_HOST,
+                ttl_dns_cache=config.http.DNS_CACHE_TTL,
+                keepalive_timeout=config.http.KEEPALIVE_TIMEOUT,
                 enable_cleanup_closed=True,
             )
 
@@ -204,7 +191,7 @@ class ScraperService:
             Tuple of (PageResult, discovered_urls)
         """
         discovered_urls: list[str] = []
-        delays = [1, 2, 4]  # Exponential backoff delays
+        delays = config.http.RETRY_DELAYS
         last_error = None
         last_failure_info = None
         crawl_time_accumulated = 0.0
@@ -249,7 +236,7 @@ class ScraperService:
                             logger.debug(f"[SCRAPE] Extracted content from {task.url} (title: {result.title})")
 
                             # Check for empty content (potential JS-blocked page)
-                            if not result.content or len(result.content.strip()) < 50:
+                            if not result.content or len(result.content.strip()) < config.content.MIN_CONTENT_LENGTH:
                                 scrape_elapsed = scrape_timer.stop()
                                 result.page_timing.crawl_ms = crawl_time_accumulated
                                 result.page_timing.scrape_ms = scrape_elapsed
@@ -278,7 +265,8 @@ class ScraperService:
 
                     elif response.status == 429:
                         # Rate limited - wait longer
-                        logger.warning(f"[HTTP] Rate limited (429): {task.url}, waiting {delays[attempt] * 2}s")
+                        wait_multiplier = config.rate_limit.RATE_LIMIT_429_MULTIPLIER
+                        logger.warning(f"[HTTP] Rate limited (429): {task.url}, waiting {delays[attempt] * wait_multiplier}s")
                         last_error = "Rate limited (429)"
                         last_failure_info = FailureInfo(
                             phase=FailurePhase.CRAWL,
@@ -287,7 +275,7 @@ class ScraperService:
                             http_status=429,
                         )
                         if attempt < self.max_retries - 1:
-                            await asyncio.sleep(delays[attempt] * 2)
+                            await asyncio.sleep(delays[attempt] * wait_multiplier)
                             continue
 
                     elif response.status >= 500:
@@ -483,7 +471,7 @@ class ScraperService:
                 text = heading.get_text(strip=True)
                 if text:
                     headings.append(f"{tag.upper()}: {text}")
-        return headings[:50]  # Limit to 50 headings
+        return headings[:config.content.MAX_HEADINGS]
 
     def _extract_content(self, soup: BeautifulSoup) -> str:
         """Extract main content from the page."""
@@ -516,9 +504,8 @@ class ScraperService:
         content = '\n'.join(lines)
 
         # Limit content length
-        max_length = 50000
-        if len(content) > max_length:
-            content = content[:max_length] + '...[truncated]'
+        if len(content) > config.content.MAX_CONTENT_LENGTH:
+            content = content[:config.content.MAX_CONTENT_LENGTH] + '...[truncated]'
 
         return content
 
