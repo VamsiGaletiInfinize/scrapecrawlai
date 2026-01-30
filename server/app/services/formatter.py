@@ -170,21 +170,15 @@ class OutputFormatter:
             if page.headings:
                 lines.append("")
                 lines.append("**Headings:**")
-                for heading in page.headings[:10]:
+                for heading in page.headings:  # Show all headings
                     lines.append(f"- {heading}")
-                if len(page.headings) > 10:
-                    lines.append(f"- ... and {len(page.headings) - 10} more")
 
             if page.content:
                 lines.append("")
-                lines.append("**Content Preview:**")
+                lines.append("**Content:**")
                 lines.append("")
                 lines.append("```")
-                # Limit content preview
-                preview = page.content[:4000]
-                if len(page.content) > 4000:
-                    preview += "\n...[truncated]"
-                lines.append(preview)
+                lines.append(page.content)  # Full content without truncation
                 lines.append("```")
 
             lines.append("")

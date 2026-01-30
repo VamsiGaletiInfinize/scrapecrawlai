@@ -317,10 +317,10 @@ async def get_organized_results(
         description="Include page content"
     ),
     max_content_length: int = Query(
-        default=5000,
+        default=10000000,  # 10MB - effectively unlimited for chat agent feeders
         ge=100,
-        le=50000,
-        description="Maximum content length per page"
+        le=10000000,
+        description="Maximum content length per page (default: unlimited)"
     ),
 ):
     """
@@ -562,7 +562,7 @@ async def get_pages_by_content_type(
 async def download_zip_export(
     job_id: str,
     include_content: bool = Query(default=True),
-    max_content_length: int = Query(default=5000, ge=100, le=50000),
+    max_content_length: int = Query(default=10000000, ge=100, le=10000000),  # Unlimited
 ):
     """
     Download complete crawl results as a ZIP file.

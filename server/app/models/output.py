@@ -53,7 +53,7 @@ class OutputConfig(BaseModel):
     include_metadata: bool = Field(default=True, description="Include metadata in output")
     include_content: bool = Field(default=True, description="Include page content")
     include_timing: bool = Field(default=True, description="Include timing information")
-    max_content_length: int = Field(default=5000, description="Maximum content length per page")
+    max_content_length: int = Field(default=10000000, description="Maximum content length per page (default: unlimited)")
     create_index: bool = Field(default=True, description="Create index files for directories")
 
 

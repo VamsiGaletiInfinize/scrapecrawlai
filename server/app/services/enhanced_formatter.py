@@ -819,12 +819,8 @@ class EnhancedFormatter:
             lines.append(f"**Total Words:** {group.total_word_count:,}")
             lines.append("")
 
-            for page in group.pages[:50]:  # Limit per group
+            for page in group.pages:  # Include all pages without limit
                 lines.extend(self._markdown_page(page, config))
-
-            if len(group.pages) > 50:
-                lines.append(f"*... and {len(group.pages) - 50} more pages*")
-                lines.append("")
 
         return lines
 
@@ -842,12 +838,8 @@ class EnhancedFormatter:
             lines.append(f"**Subdomains:** {', '.join(group.subdomains)}")
             lines.append("")
 
-            for page in group.pages[:50]:
+            for page in group.pages:  # Include all pages without limit
                 lines.extend(self._markdown_page(page, config))
-
-            if len(group.pages) > 50:
-                lines.append(f"*... and {len(group.pages) - 50} more pages*")
-                lines.append("")
 
         return lines
 
@@ -865,12 +857,8 @@ class EnhancedFormatter:
             lines.append(f"**Subdomains:** {', '.join(group.subdomains)}")
             lines.append("")
 
-            for page in group.pages[:50]:
+            for page in group.pages:  # Include all pages without limit
                 lines.extend(self._markdown_page(page, config))
-
-            if len(group.pages) > 50:
-                lines.append(f"*... and {len(group.pages) - 50} more pages*")
-                lines.append("")
 
         return lines
 
@@ -895,15 +883,13 @@ class EnhancedFormatter:
         if by_status.same_domain_success.pages:
             lines.append("| URL | Depth | Title | Links | Crawl (ms) | Scrape (ms) |")
             lines.append("|-----|-------|-------|-------|------------|-------------|")
-            for page in by_status.same_domain_success.pages[:100]:
+            for page in by_status.same_domain_success.pages:  # All pages without limit
                 title = (page.metadata.title or '-')[:40]
                 lines.append(
                     f"| {page.metadata.url[:60]}... | {page.metadata.depth} | "
                     f"{title} | {page.metadata.links_found} | "
                     f"{page.metadata.timing.crawl_ms:.0f} | {page.metadata.timing.scrape_ms:.0f} |"
                 )
-            if len(by_status.same_domain_success.pages) > 100:
-                lines.append(f"| *... and {len(by_status.same_domain_success.pages) - 100} more* | | | | | |")
         lines.append("")
 
         # TABLE 2: External / Different Domain Pages
@@ -912,23 +898,19 @@ class EnhancedFormatter:
         lines.append(f"**Total Pages:** {by_status.external_domain.page_count}")
         lines.append(f"**Subdomain Pages:** {by_status.external_domain.subdomain_count}")
         lines.append(f"**External Domain Pages:** {by_status.external_domain.external_count}")
-        lines.append(f"**Domains Found:** {', '.join(by_status.external_domain.domains[:10])}")
-        if len(by_status.external_domain.domains) > 10:
-            lines.append(f"  *... and {len(by_status.external_domain.domains) - 10} more domains*")
+        lines.append(f"**Domains Found:** {', '.join(by_status.external_domain.domains)}")  # All domains
         lines.append("")
 
         if by_status.external_domain.pages:
             lines.append("| URL | Parent Source | Domain | Depth | Status |")
             lines.append("|-----|---------------|--------|-------|--------|")
-            for page in by_status.external_domain.pages[:100]:
+            for page in by_status.external_domain.pages:  # All pages without limit
                 parent = (page.metadata.parent_url or '-')[:40]
                 status = 'Error' if page.metadata.error else 'Success'
                 lines.append(
                     f"| {page.metadata.url[:50]}... | {parent} | "
                     f"{page.metadata.subdomain} | {page.metadata.depth} | {status} |"
                 )
-            if len(by_status.external_domain.pages) > 100:
-                lines.append(f"| *... and {len(by_status.external_domain.pages) - 100} more* | | | | |")
         lines.append("")
 
         # TABLE 3: Error / Failed Pages
@@ -956,15 +938,13 @@ class EnhancedFormatter:
             lines.append("")
             lines.append("| URL | Depth | Failure Type | Failure Reason | Time Before Failure (ms) |")
             lines.append("|-----|-------|--------------|----------------|-------------------------|")
-            for page in by_status.errors.pages[:100]:
+            for page in by_status.errors.pages:  # All pages without limit
                 reason = (page.metadata.failure.reason or page.metadata.error or '-')[:40]
                 time_wasted = page.metadata.timing.time_before_failure_ms or page.metadata.timing.total_ms
                 lines.append(
                     f"| {page.metadata.url[:50]}... | {page.metadata.depth} | "
                     f"{page.metadata.failure.type} | {reason} | {time_wasted:.0f} |"
                 )
-            if len(by_status.errors.pages) > 100:
-                lines.append(f"| *... and {len(by_status.errors.pages) - 100} more* | | | | |")
         lines.append("")
 
         return lines
@@ -1023,19 +1003,14 @@ class EnhancedFormatter:
         if page.headings:
             lines.append("")
             lines.append("**Headings:**")
-            for h in page.headings[:5]:
-                lines.append(f"  - {h}")
-            if len(page.headings) > 5:
-                lines.append(f"  - *... and {len(page.headings) - 5} more*")
+            for h in page.headings:  # Show all headings without truncation
+                lines.append(f"- {h}")
 
         if config.include_content and page.content:
             lines.append("")
-            lines.append("**Content Preview:**")
+            lines.append("**Content:**")
             lines.append("```")
-            preview = page.content[:config.max_content_length]
-            if len(page.content) > config.max_content_length:
-                preview += "\n...[truncated]"
-            lines.append(preview)
+            lines.append(page.content)  # Full content without truncation
             lines.append("```")
 
         lines.append("")

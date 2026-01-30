@@ -471,7 +471,7 @@ class ScraperService:
                 text = heading.get_text(strip=True)
                 if text:
                     headings.append(f"{tag.upper()}: {text}")
-        return headings[:config.content.MAX_HEADINGS]
+        return headings  # Return all headings without truncation
 
     def _extract_content(self, soup: BeautifulSoup) -> str:
         """Extract main content from the page."""
@@ -503,10 +503,7 @@ class ScraperService:
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         content = '\n'.join(lines)
 
-        # Limit content length
-        if len(content) > config.content.MAX_CONTENT_LENGTH:
-            content = content[:config.content.MAX_CONTENT_LENGTH] + '...[truncated]'
-
+        # Return full content without truncation (for chat agent feeders)
         return content
 
 

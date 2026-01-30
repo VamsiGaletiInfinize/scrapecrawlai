@@ -552,7 +552,7 @@ class TestOutputModels:
         assert config.organization == OrganizationType.FLAT
         assert config.include_metadata is True
         assert config.include_content is True
-        assert config.max_content_length == 5000
+        assert config.max_content_length == 10000000  # Unlimited for chat agent feeders
 
     def test_page_metadata_creation(self):
         """Test PageMetadata model creation."""

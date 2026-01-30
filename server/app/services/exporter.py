@@ -503,13 +503,10 @@ class DirectoryExporter:
         lines.append("| Title | URL | Words | Type |")
         lines.append("|-------|-----|-------|------|")
 
-        for page in pages[:100]:  # Limit table rows
+        for page in pages:  # All pages without limit
             title = (page.metadata.title or 'Untitled')[:50]
             url = page.metadata.url[:60] + ('...' if len(page.metadata.url) > 60 else '')
             lines.append(f"| {title} | {url} | {page.metadata.word_count} | {page.metadata.content_type.value} |")
-
-        if len(pages) > 100:
-            lines.append(f"\n*... and {len(pages) - 100} more pages (see pages.json for complete list)*")
 
         return "\n".join(lines)
 
